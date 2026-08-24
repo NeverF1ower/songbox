@@ -3296,11 +3296,47 @@ select_handshake_target() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 网络调优（识别现状优先，默认不覆盖已有配置）
 #═══════════════════════════════════════════════════════════════════════════════
-# 文件名用 99-zz- 前缀：sysctl --system 按字典序加载 /etc/sysctl.d/*.conf，
-# 原来的 99-bbr-proxy.conf 会被 99-sysctl.conf 之类覆盖，重启后静默失效
+# 文件名用 99-zz- 前缀：同一 sysctl.d 目录内按字典序加载，保证晚于常见的
+# 99-kejilion-*.conf；Alpine 默认 sysctl 可能不支持 --system，必须直接 -p 应用
 readonly SYSCTL_CONF="/etc/sysctl.d/99-zz-vless-tuning.conf"
 readonly SYSCTL_LEGACY="/etc/sysctl.d/99-bbr-proxy.conf"
 readonly BBR_MODULE_CONF="/etc/modules-load.d/99-vless-bbr.conf"
+
+# 让 Alpine/OpenRC 在重启后继续加载 /etc/sysctl.d/*.conf。
+_ensure_sysctl_boot_load() {
+    [[ "$DISTRO" == "alpine" ]] || return 0
+    if ! rc-update add sysctl boot >/dev/null 2>&1; then
+        _warn "无法把 sysctl 服务加入 OpenRC boot，配置已立即应用但重启后可能失效"
+        return 1
+    fi
+}
+
+# 直接把刚生成的文件最后应用。BusyBox sysctl 支持 -p，但不支持 procps-ng 的
+# --system；直接 -p 也能确保当前生效值不会再被较早的 kejilion 文件抢回去。
+_apply_sysctl_file() {
+    local file="$1"
+    [[ -r "$file" ]] || { _warn "sysctl 配置不存在或不可读: ${file}"; return 1; }
+    _ensure_sysctl_boot_load || true
+    if ! sysctl -p "$file" >/dev/null; then
+        _warn "sysctl -p ${file} 返回失败，将逐项回读定位未生效参数"
+        return 1
+    fi
+}
+
+# 删除配置后要重新加载系统剩余配置。Alpine 使用其 OpenRC sysctl 服务维护
+# /lib、/usr/lib、/etc 与 /run 下的加载顺序；其它发行版继续使用 --system。
+_reload_system_sysctl() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        _ensure_sysctl_boot_load || true
+        if [[ ! -x /etc/init.d/sysctl ]]; then
+            _warn "未找到 Alpine OpenRC sysctl 服务，无法自动恢复其余 sysctl 配置"
+            return 1
+        fi
+        rc-service sysctl restart >/dev/null
+    else
+        sysctl --system >/dev/null
+    fi
+}
 
 # 列出所有声明过某个 key 的配置文件（不含本脚本自己的）
 _sysctl_sources() {
@@ -3638,7 +3674,7 @@ apply_tuning_missing_only() {
     if [[ "$added" -eq 0 ]]; then
         if [[ -f "$SYSCTL_CONF" ]]; then
             rm -f "$SYSCTL_CONF"
-            sysctl --system >/dev/null 2>&1
+            _reload_system_sysctl || _warn "重新加载系统 sysctl 配置失败"
             _ok "其它配置已覆盖全部推荐参数，已清除本脚本的重复配置"
         else
             _ok "没有需要补齐的项，现有配置已覆盖全部推荐参数"
@@ -3651,10 +3687,11 @@ apply_tuning_missing_only() {
         echo "# 仅补齐未被其它配置文件设置的项；文件名 99-zz- 保证最后加载"
         echo "$lines"
     } >"$SYSCTL_CONF"
-    if ! sysctl --system >/dev/null 2>&1; then
-        _warn "sysctl --system 返回失败，将逐项回读定位未生效参数"
+    if _apply_sysctl_file "$SYSCTL_CONF"; then
+        _ok "已补齐 ${added} 项（跳过 ${skipped} 项已有配置）"
+    else
+        _warn "配置文件已写入，但有参数未能立即应用"
     fi
-    _ok "已补齐 ${added} 项（跳过 ${skipped} 项已有配置）"
     _verify_tuning_applied
 }
 
@@ -3679,10 +3716,11 @@ apply_tuning_full() {
             echo "${key} = ${REC_SYSCTL[$key]}"
         done
     } >"$SYSCTL_CONF"
-    if ! sysctl --system >/dev/null 2>&1; then
-        _warn "sysctl --system 返回失败，将逐项回读定位未生效参数"
+    if _apply_sysctl_file "$SYSCTL_CONF"; then
+        _ok "推荐配置已套用（档位: ${TIER}）"
+    else
+        _warn "推荐配置已写入，但有参数未能立即应用（档位: ${TIER}）"
     fi
-    _ok "推荐配置已套用（档位: ${TIER}）"
     _verify_tuning_applied
 }
 
@@ -3709,7 +3747,7 @@ remove_tuning() {
     if [[ -f "$SYSCTL_LEGACY" ]]; then
         _ask_yes "同时删除旧版遗留的 ${SYSCTL_LEGACY##*/}?" && { rm -f "$SYSCTL_LEGACY"; ((removed++)); }
     fi
-    sysctl --system >/dev/null 2>&1
+    _reload_system_sysctl || _warn "重新加载系统 sysctl 配置失败"
     [[ "$removed" -gt 0 ]] && _ok "已移除 ${removed} 个本脚本写入的配置（BBR 模块和转发状态需重启才完全回到默认）" \
         || _info "没有本脚本写入的配置"
 }
@@ -3734,7 +3772,7 @@ network_tuning_menu() {
             4) remove_tuning; _pause ;;
             5)
                 if [[ -f "$SYSCTL_LEGACY" ]]; then
-                    rm -f "$SYSCTL_LEGACY"; sysctl --system >/dev/null 2>&1
+                    rm -f "$SYSCTL_LEGACY"; _reload_system_sysctl || _warn "重新加载系统 sysctl 配置失败"
                     _ok "已删除 ${SYSCTL_LEGACY}"
                 else
                     _info "没有遗留文件"
@@ -3765,7 +3803,7 @@ _tfo_enable_kernel() {
     # 单独一个文件只放这一项，不碰用户其它调优
     echo "# TCP Fast Open (服务端+客户端) - 由 ${SCRIPT_NAME} 写入" >/etc/sysctl.d/99-zz-vless-tfo.conf
     echo "net.ipv4.tcp_fastopen = $nv" >>/etc/sysctl.d/99-zz-vless-tfo.conf
-    sysctl --system >/dev/null 2>&1
+    _apply_sysctl_file /etc/sysctl.d/99-zz-vless-tfo.conf || return 1
     _ok "内核 TCP Fast Open 已开启 (tcp_fastopen=$nv)"
 }
 
