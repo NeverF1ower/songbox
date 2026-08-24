@@ -28,6 +28,7 @@ fi
 readonly VERSION="0.0.5"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="SingBox 万能工具箱"
+readonly CUSTOM_BUILD="alpine-sysctl+realm"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（可用环境变量 VLESS_SCRIPT_RAW_URL / VLESS_REPO_URL 临时覆盖）
@@ -41,6 +42,12 @@ readonly DB_LOCK_FILE="$CFG/.db.lock"
 readonly SB_CONFIG="$CFG/singbox.json"
 readonly SB_BIN="/usr/local/bin/sing-box"
 readonly SB_SVC="vless-singbox"
+readonly REALM_DIR="$CFG/realm"
+readonly REALM_BIN="$REALM_DIR/realm"
+readonly REALM_CONF="$REALM_DIR/config.toml"
+readonly REALM_VERSION_FILE="$REALM_DIR/version"
+readonly REALM_SVC="vless-realm"
+readonly REALM_REPO="zhboner/realm"
 readonly RULESET_DIR="$CFG/ruleset"
 readonly LOG_FILE="/var/log/vless-server.log"
 # 不内置任何第三方或私人邮箱；如需默认值可显式设置 VLESS_ACME_EMAIL
@@ -146,6 +153,7 @@ declare -A SVC_PROC=(
     [vless-snell-v6]="snell-server-v6"
     [vless-snell-shadowtls]="shadow-tls"
     [vless-snell-v5-shadowtls]="shadow-tls"
+    [vless-realm]="realm"
     [nginx]="nginx"
 )
 
@@ -9710,6 +9718,8 @@ do_update() {
     _line
     echo -e "  当前版本: ${G}v${VERSION}${NC}" >&2
     [[ -n "$REPO_URL" ]] && echo -e "  仓库    : ${D}${REPO_URL}${NC}" >&2
+    echo -e "  构建    : ${Y}${CUSTOM_BUILD}${NC}" >&2
+    _warn "在线更新会覆盖本构建的 Alpine sysctl 兼容与 Realm 菜单，请先备份当前脚本"
 
     if [[ -z "$SCRIPT_RAW_URL" ]]; then
         _line
@@ -9787,6 +9797,764 @@ do_update() {
     rm -f "$tmp"; _err "写入失败（权限不足?）"; return 1
 }
 
+#═══════════════════════════════════════════════════════════════════════════════
+# Realm TCP / UDP 端口转发（官方 Realm 内核，兼容 systemd / OpenRC）
+#═══════════════════════════════════════════════════════════════════════════════
+_realm_version() {
+    [[ -x "$REALM_BIN" ]] || return 1
+    "$REALM_BIN" --version 2>/dev/null | head -1 |
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)?' | head -1
+}
+
+_realm_libc() {
+    if [[ "$DISTRO" == "alpine" ]] ||
+       ls /lib/ld-musl-*.so.1 >/dev/null 2>&1 ||
+       (check_cmd ldd && ldd --version 2>&1 | grep -qi musl); then
+        echo "musl"
+    else
+        echo "gnu"
+    fi
+}
+
+_realm_target() {
+    local libc; libc=$(_realm_libc)
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "x86_64-unknown-linux-${libc}" ;;
+        aarch64|arm64) echo "aarch64-unknown-linux-${libc}" ;;
+        armv7l)        echo "armv7-unknown-linux-${libc}eabihf" ;;
+        armv6l|arm)    echo "arm-unknown-linux-${libc}eabihf" ;;
+        *) return 1 ;;
+    esac
+}
+
+_realm_ensure_dependencies() {
+    local missing=() cmd
+    for cmd in curl jq tar install; do check_cmd "$cmd" || missing+=("$cmd"); done
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+    _info "安装 Realm 所需依赖: ${missing[*]}"
+    if check_cmd apk; then
+        apk add --no-cache curl jq ca-certificates tar coreutils >/dev/null 2>&1
+    elif check_cmd apt-get; then
+        apt-get update >/dev/null 2>&1 &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq ca-certificates tar coreutils >/dev/null 2>&1
+    elif check_cmd yum; then
+        yum install -y curl jq ca-certificates tar coreutils >/dev/null 2>&1
+    else
+        _err "无法识别包管理器，请手动安装: curl jq tar ca-certificates"
+        return 1
+    fi
+    for cmd in curl jq tar install; do
+        check_cmd "$cmd" || { _err "依赖安装失败: $cmd"; return 1; }
+    done
+}
+
+_realm_init_config() {
+    mkdir -p "$REALM_DIR" || { _err "无法创建 $REALM_DIR"; return 1; }
+    chmod 700 "$REALM_DIR" 2>/dev/null || true
+    if [[ ! -s "$REALM_CONF" ]]; then
+        cat >"$REALM_CONF" <<'EOFREALM'
+[network]
+no_tcp = false
+use_udp = true
+ipv6_only = false
+EOFREALM
+        chmod 600 "$REALM_CONF"
+        _ok "已创建 Realm 配置: $REALM_CONF"
+    else
+        chmod 600 "$REALM_CONF" 2>/dev/null || true
+    fi
+}
+
+create_realm_service() {
+    [[ -x "$REALM_BIN" ]] || { _err "Realm 核心不存在: $REALM_BIN"; return 1; }
+    [[ -s "$REALM_CONF" ]] || _realm_init_config || return 1
+    if [[ "$DISTRO" == "alpine" ]]; then
+        _write_openrc "$REALM_SVC" "Realm TCP/UDP Relay" "$REALM_BIN" "-c $REALM_CONF" "" "0"
+        cat >>"/etc/init.d/$REALM_SVC" <<EOF
+output_log="/var/log/$REALM_SVC.log"
+error_log="/var/log/$REALM_SVC.log"
+EOF
+        chmod 755 "/etc/init.d/$REALM_SVC"
+    else
+        _write_systemd "$REALM_SVC" "Realm TCP/UDP Relay" "$REALM_BIN -c $REALM_CONF"
+    fi
+}
+
+install_realm_core() {
+    local force="${1:-false}" ver_override="${2:-}"
+    if [[ -x "$REALM_BIN" && "$force" != "true" ]]; then
+        _realm_init_config || return 1
+        create_realm_service || return 1
+        _ok "Realm 已安装 (v$(_realm_version 2>/dev/null || echo 未知))"
+        return 0
+    fi
+
+    _realm_ensure_dependencies || return 1
+    local target; target=$(_realm_target) || {
+        _err "Realm 暂不支持此架构: $(uname -m)"
+        return 1
+    }
+    local tag="$ver_override"
+    if [[ -z "$tag" ]]; then
+        _info "查询 Realm 官方最新版本..."
+        tag=$(_gh_latest_tag "$REALM_REPO")
+    fi
+    [[ -n "$tag" ]] || { _err "无法取得 Realm 最新版本"; return 1; }
+    [[ "$tag" == v* ]] || tag="v$tag"
+
+    local asset="realm-${target}.tar.gz"
+    local url="https://github.com/$REALM_REPO/releases/download/$tag/$asset"
+    local tmp archive expected candidate newbin was_running=false
+    tmp=$(mktemp -d) || return 1
+    archive="$tmp/$asset"
+    _info "系统匹配: $DISTRO / $(uname -m) / $(_realm_libc)"
+    _info "下载 Realm $tag: $asset"
+    if ! curl -fL --retry 2 --connect-timeout 10 --max-time 180 -o "$archive" "$url"; then
+        rm -rf "$tmp"; _err "Realm 下载失败: $url"; return 1
+    fi
+
+    expected=$(_gh_asset_sha256 "$REALM_REPO" "$tag" "$asset" 2>/dev/null || true)
+    if [[ -n "$expected" ]]; then
+        if ! _verify_sha256 "$archive" "$expected"; then
+            rm -rf "$tmp"; _err "Realm SHA-256 校验失败，已拒绝安装"; return 1
+        fi
+        _ok "Realm SHA-256 校验通过"
+    else
+        _confirm_unverified "Realm $tag / $asset" || { rm -rf "$tmp"; return 1; }
+    fi
+
+    _archive_safe "$archive" "tar.gz" || {
+        rm -rf "$tmp"; _err "Realm 压缩包路径校验失败"; return 1; }
+    mkdir -p "$tmp/extract"
+    tar -xzf "$archive" -C "$tmp/extract" 2>/dev/null || {
+        rm -rf "$tmp"; _err "Realm 解包失败"; return 1; }
+    candidate=$(find "$tmp/extract" -type f -name realm -print -quit 2>/dev/null)
+    [[ -f "$candidate" ]] || { rm -rf "$tmp"; _err "压缩包中未找到 realm"; return 1; }
+    chmod 755 "$candidate"
+    "$candidate" --version >/dev/null 2>&1 || {
+        rm -rf "$tmp"; _err "下载的 Realm 核心无法在本系统运行（资产: $asset）"; return 1; }
+
+    svc status "$REALM_SVC" >/dev/null 2>&1 && was_running=true
+    mkdir -p "$REALM_DIR"; chmod 700 "$REALM_DIR" 2>/dev/null || true
+    newbin="$REALM_DIR/.realm.new"
+    install -m 755 "$candidate" "$newbin" &&
+        mv -f "$newbin" "$REALM_BIN" || {
+            rm -f "$newbin"; rm -rf "$tmp"; _err "写入 Realm 核心失败"; return 1; }
+    printf '%s\n' "$tag" >"$REALM_VERSION_FILE"
+    chmod 600 "$REALM_VERSION_FILE"
+    rm -rf "$tmp"
+
+    _realm_init_config || return 1
+    create_realm_service || return 1
+    if [[ "$was_running" == "true" ]]; then
+        svc restart "$REALM_SVC" >/dev/null 2>&1 || {
+            _err "Realm 核心已更新，但服务重启失败"; return 1; }
+    fi
+    _ok "Realm $tag 安装完成 ($target)"
+}
+
+_realm_rule_count() {
+    [[ -f "$REALM_CONF" ]] || { echo 0; return; }
+    local n
+    n=$(grep -c '^[[:space:]]*\[\[endpoints\]\][[:space:]]*$' "$REALM_CONF" 2>/dev/null || true)
+    echo "${n:-0}"
+}
+
+_realm_rules_tsv() {
+    [[ -f "$REALM_CONF" ]] || return 0
+    awk '
+        function value(line, x) {
+            x=line
+            sub(/^[^"]*"/, "", x)
+            sub(/".*$/, "", x)
+            return x
+        }
+        function flush() {
+            if (!inside) return
+            gsub(/\t/, " ", remark)
+            print idx "\t" listen "\t" remote "\t" remark
+        }
+        /^[[:space:]]*\[\[endpoints\]\][[:space:]]*$/ {
+            flush()
+            inside=1; idx++; listen=""; remote=""; remark=""
+            next
+        }
+        /^[[:space:]]*\[/ {
+            if (inside) flush()
+            inside=0
+            next
+        }
+        inside && /^[[:space:]]*#[[:space:]]*备注[[:space:]]*:/ {
+            remark=$0
+            sub(/^[[:space:]]*#[[:space:]]*备注[[:space:]]*:[[:space:]]*/, "", remark)
+            next
+        }
+        inside && /^[[:space:]]*listen[[:space:]]*=/ { listen=value($0); next }
+        inside && /^[[:space:]]*remote[[:space:]]*=/ { remote=value($0); next }
+        END { flush() }
+    ' "$REALM_CONF"
+}
+
+_realm_listen_port() {
+    local value="$1" port="${1##*:}"
+    port="${port//[^0-9]/}"
+    _is_valid_port "$port" && echo "$port"
+}
+
+_realm_format_addr() {
+    local host="$1" port="$2"
+    host="${host#[}"; host="${host%]}"
+    if [[ "$host" == *:* ]]; then printf '[%s]:%s' "$host" "$port"
+    else printf '%s:%s' "$host" "$port"; fi
+}
+
+_realm_default_listen() {
+    local port="$1"
+    if [[ -s /proc/net/if_inet6 ]] &&
+       [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" != "1" ]]; then
+        echo "[::]:$port"
+    else
+        echo "0.0.0.0:$port"
+    fi
+}
+
+_realm_parse_remote() {
+    local value="$1"
+    REALM_PARSE_HOST=""; REALM_PARSE_PORT=""
+    if [[ "$value" =~ ^\[([^][]+)\]:([0-9]+)$ ]]; then
+        REALM_PARSE_HOST="${BASH_REMATCH[1]}"; REALM_PARSE_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$value" =~ ^([^:]+):([0-9]+)$ ]]; then
+        REALM_PARSE_HOST="${BASH_REMATCH[1]}"; REALM_PARSE_PORT="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+    _is_valid_host "$REALM_PARSE_HOST" && _is_valid_port "$REALM_PARSE_PORT"
+}
+
+_realm_safe_remark() {
+    local v="$1"
+    v="${v//$'\r'/ }"; v="${v//$'\n'/ }"; v="${v//$'\t'/ }"
+    v="${v//\\/}"; v="${v//|/／}"
+    printf '%s' "$v"
+}
+
+_realm_port_in_config() {
+    local wanted="$1" exclude="${2:-0}" idx listen remote remark port
+    while IFS=$'\t' read -r idx listen remote remark; do
+        [[ "$idx" == "$exclude" ]] && continue
+        port=$(_realm_listen_port "$listen")
+        [[ "$port" == "$wanted" ]] && return 0
+    done < <(_realm_rules_tsv)
+    return 1
+}
+
+_realm_append_rule() {
+    local local_port="$1" remote_host="$2" remote_port="$3" remark="${4:-}"
+    _is_valid_port "$local_port" || return 1
+    _is_valid_host "$remote_host" || return 1
+    _is_valid_port "$remote_port" || return 1
+    remark=$(_realm_safe_remark "$remark")
+    local listen remote
+    listen=$(_realm_default_listen "$local_port")
+    remote=$(_realm_format_addr "$remote_host" "$remote_port")
+    printf '\n[[endpoints]]\n# 备注: %s\nlisten = "%s"\nremote = "%s"\n' \
+        "$remark" "$listen" "$remote" >>"$REALM_CONF"
+    chmod 600 "$REALM_CONF" 2>/dev/null || true
+}
+
+realm_show_rules() {
+    local count; count=$(_realm_rule_count)
+    if (( count == 0 )); then _warn "没有 Realm 转发规则"; return 1; fi
+    _line
+    printf '  %-4s %-8s %-34s %s\n' "序号" "本地端口" "远程地址" "备注" >&2
+    _line
+    local idx listen remote remark port
+    while IFS=$'\t' read -r idx listen remote remark; do
+        port=$(_realm_listen_port "$listen")
+        printf '  %-4s %-8s %-34s %s\n' "$idx" "${port:--}" "${remote:--}" "${remark:--}" >&2
+    done < <(_realm_rules_tsv)
+    _line
+    echo -e "  配置: ${C}$REALM_CONF${NC}" >&2
+}
+
+realm_show_logs() {
+    _line
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rc-service "$REALM_SVC" status 2>&1 | tail -20 >&2 || true
+        if [[ -f "/var/log/$REALM_SVC.log" ]]; then
+            echo -e "  ${D}最近日志:${NC}" >&2
+            tail -n 80 "/var/log/$REALM_SVC.log" >&2
+        else
+            _info "暂无 /var/log/$REALM_SVC.log"
+        fi
+    else
+        systemctl status "$REALM_SVC" --no-pager -l 2>&1 | tail -20 >&2 || true
+        journalctl -u "$REALM_SVC" -n 80 --no-pager 2>/dev/null >&2 || true
+    fi
+    _line
+}
+
+realm_start_service() {
+    [[ -x "$REALM_BIN" ]] || install_realm_core false || return 1
+    _realm_init_config || return 1
+    (( $(_realm_rule_count) > 0 )) || { _warn "请先添加至少一条转发规则"; return 1; }
+    create_realm_service || return 1
+    svc enable "$REALM_SVC" >/dev/null 2>&1 || true
+    if svc status "$REALM_SVC" >/dev/null 2>&1; then
+        svc restart "$REALM_SVC" >/dev/null 2>&1
+    else
+        svc start "$REALM_SVC" >/dev/null 2>&1
+    fi
+    sleep 1
+    if svc status "$REALM_SVC" >/dev/null 2>&1; then
+        _ok "Realm 服务运行中"
+        return 0
+    fi
+    _err "Realm 服务启动失败"
+    realm_show_logs
+    return 1
+}
+
+realm_stop_service() {
+    if svc status "$REALM_SVC" >/dev/null 2>&1; then
+        svc stop "$REALM_SVC" >/dev/null 2>&1
+        _ok "Realm 服务已停止"
+    else
+        _info "Realm 服务未运行"
+    fi
+}
+
+realm_restart_service() {
+    [[ -x "$REALM_BIN" && -s "$REALM_CONF" ]] || {
+        _err "Realm 核心或配置不存在"; return 1; }
+    (( $(_realm_rule_count) > 0 )) || { _warn "没有转发规则，不启动服务"; return 1; }
+    create_realm_service || return 1
+    svc enable "$REALM_SVC" >/dev/null 2>&1 || true
+    svc restart "$REALM_SVC" >/dev/null 2>&1 || svc start "$REALM_SVC" >/dev/null 2>&1
+    sleep 1
+    if svc status "$REALM_SVC" >/dev/null 2>&1; then
+        _ok "Realm 服务已重启"
+        return 0
+    fi
+    _err "Realm 服务重启失败"
+    realm_show_logs
+    return 1
+}
+
+realm_add_rule() {
+    [[ -x "$REALM_BIN" ]] || install_realm_core false || return 1
+    _realm_init_config || return 1
+    local local_port remote_host remote_port remark
+    while true; do
+        read -rp "  本地监听端口: " local_port
+        _is_valid_port "$local_port" || { _err "端口必须是 1-65535"; continue; }
+        _realm_port_in_config "$local_port" && { _err "Realm 已使用本地端口 $local_port"; continue; }
+        if _port_listening "$local_port"; then
+            _err "端口 $local_port 已被其它进程监听"; continue
+        fi
+        break
+    done
+    while true; do
+        read -rp "  远程主机/IP: " remote_host
+        remote_host="${remote_host#[}"; remote_host="${remote_host%]}"
+        _is_valid_host "$remote_host" && break
+        _err "远程主机无效"
+    done
+    while true; do
+        read -rp "  远程端口: " remote_port
+        _is_valid_port "$remote_port" && break
+        _err "端口必须是 1-65535"
+    done
+    read -rp "  备注 [可留空]: " remark
+    _realm_append_rule "$local_port" "$remote_host" "$remote_port" "$remark" || {
+        _err "写入规则失败"; return 1; }
+    allow_port "$local_port" tcp
+    allow_port "$local_port" udp
+    _ok "已添加: $(_realm_default_listen "$local_port") → $(_realm_format_addr "$remote_host" "$remote_port")"
+    realm_start_service
+}
+
+realm_modify_rule() {
+    local count; count=$(_realm_rule_count)
+    (( count > 0 )) || { _warn "没有可修改的规则"; return 1; }
+    realm_show_rules || return 1
+    local pick; read -rp "  要修改的序号 [0 返回]: " pick
+    [[ "$pick" == "0" || -z "$pick" ]] && return 0
+    [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= count )) || {
+        _err "无效序号"; return 1; }
+
+    local idx listen remote remark old_port="" old_host="" old_remote_port=""
+    while IFS=$'\t' read -r idx listen remote remark; do
+        [[ "$idx" == "$pick" ]] || continue
+        old_port=$(_realm_listen_port "$listen")
+        _realm_parse_remote "$remote" && {
+            old_host="$REALM_PARSE_HOST"; old_remote_port="$REALM_PARSE_PORT"; }
+        break
+    done < <(_realm_rules_tsv)
+    [[ -n "$old_port" && -n "$old_host" ]] || {
+        _err "无法解析该规则，请使用“手动编辑 config.toml”"; return 1; }
+
+    local local_port remote_host remote_port new_remark
+    while true; do
+        read -rp "  本地端口 [$old_port]: " local_port
+        local_port="${local_port:-$old_port}"
+        _is_valid_port "$local_port" || { _err "端口无效"; continue; }
+        _realm_port_in_config "$local_port" "$pick" && {
+            _err "其它 Realm 规则已使用该端口"; continue; }
+        if [[ "$local_port" != "$old_port" ]] && _port_listening "$local_port"; then
+            _err "端口 $local_port 已被其它进程监听"; continue
+        fi
+        break
+    done
+    while true; do
+        read -rp "  远程主机 [$old_host]: " remote_host
+        remote_host="${remote_host:-$old_host}"
+        remote_host="${remote_host#[}"; remote_host="${remote_host%]}"
+        _is_valid_host "$remote_host" && break
+        _err "远程主机无效"
+    done
+    while true; do
+        read -rp "  远程端口 [$old_remote_port]: " remote_port
+        remote_port="${remote_port:-$old_remote_port}"
+        _is_valid_port "$remote_port" && break
+        _err "远程端口无效"
+    done
+    read -rp "  备注 [${remark:-无}]: " new_remark
+    new_remark="${new_remark:-$remark}"
+    new_remark=$(_realm_safe_remark "$new_remark")
+
+    local backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')" tmp
+    cp -a "$REALM_CONF" "$backup"
+    tmp=$(mktemp "$REALM_DIR/config.XXXXXX") || return 1
+    local new_listen new_remote
+    new_listen=$(_realm_default_listen "$local_port")
+    new_remote=$(_realm_format_addr "$remote_host" "$remote_port")
+    awk -v target="$pick" -v listen="$new_listen" -v remote="$new_remote" -v remark="$new_remark" '
+        /^[[:space:]]*\[\[endpoints\]\][[:space:]]*$/ {
+            idx++; selected=(idx == target)
+            print
+            if (selected) print "# 备注: " remark
+            next
+        }
+        /^[[:space:]]*\[/ { selected=0 }
+        selected && /^[[:space:]]*#[[:space:]]*备注[[:space:]]*:/ { next }
+        selected && /^[[:space:]]*listen[[:space:]]*=/ {
+            print "listen = \"" listen "\""; next
+        }
+        selected && /^[[:space:]]*remote[[:space:]]*=/ {
+            print "remote = \"" remote "\""; next
+        }
+        { print }
+    ' "$REALM_CONF" >"$tmp" && mv "$tmp" "$REALM_CONF" || {
+        rm -f "$tmp"; _err "修改配置失败"; return 1; }
+    chmod 600 "$REALM_CONF"
+    allow_port "$local_port" tcp
+    allow_port "$local_port" udp
+    _ok "规则已修改（旧配置: $backup）"
+    if svc status "$REALM_SVC" >/dev/null 2>&1; then realm_restart_service; fi
+}
+
+_realm_delete_endpoint() {
+    local target="$1" tmp
+    tmp=$(mktemp "$REALM_DIR/config.XXXXXX") || return 1
+    awk -v target="$target" '
+        /^[[:space:]]*\[\[endpoints\]\][[:space:]]*$/ {
+            idx++; skip=(target == "all" || idx == target)
+            if (!skip) print
+            next
+        }
+        /^[[:space:]]*\[/ {
+            if ($0 !~ /^[[:space:]]*\[\[endpoints\]\][[:space:]]*$/) skip=0
+        }
+        !skip { print }
+    ' "$REALM_CONF" >"$tmp" && mv "$tmp" "$REALM_CONF" || {
+        rm -f "$tmp"; return 1; }
+    chmod 600 "$REALM_CONF"
+}
+
+realm_delete_rule() {
+    local count; count=$(_realm_rule_count)
+    (( count > 0 )) || { _warn "没有可删除的规则"; return 1; }
+    realm_show_rules || return 1
+    local pick label
+    read -rp "  删除序号（a=全部，0=返回）: " pick
+    [[ "$pick" == "0" || -z "$pick" ]] && return 0
+    if [[ "$pick" != "a" && "$pick" != "A" ]]; then
+        [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= count )) || {
+            _err "无效序号"; return 1; }
+        label="第 $pick 条规则"
+    else
+        pick="all"; label="全部规则"
+    fi
+    _ask_yes "确认删除$label?" || return 0
+    local backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')"
+    cp -a "$REALM_CONF" "$backup"
+    _realm_delete_endpoint "$pick" || { _err "删除失败"; return 1; }
+    _ok "已删除（旧配置: $backup）"
+    if (( $(_realm_rule_count) == 0 )); then
+        realm_stop_service
+    elif svc status "$REALM_SVC" >/dev/null 2>&1; then
+        realm_restart_service
+    fi
+}
+
+realm_edit_config() {
+    _realm_init_config || return 1
+    local editor=""
+    if [[ -n "${VISUAL:-}" ]] && check_cmd "$VISUAL"; then
+        editor="$VISUAL"
+    elif [[ -n "${EDITOR:-}" ]] && check_cmd "$EDITOR"; then
+        editor="$EDITOR"
+    else
+        local e
+        for e in nano vi vim; do check_cmd "$e" && { editor="$e"; break; }; done
+    fi
+    [[ -n "$editor" ]] || {
+        _err "未找到文本编辑器，请安装 nano/vi，或设置 EDITOR"; return 1; }
+    local backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')"
+    cp -a "$REALM_CONF" "$backup"
+    _info "使用 $editor 编辑 $REALM_CONF"
+    "$editor" "$REALM_CONF"
+    local rc=$?
+    chmod 600 "$REALM_CONF" 2>/dev/null || true
+    (( rc == 0 )) || {
+        _warn "编辑器异常退出，原配置保留在 $backup"; return "$rc"; }
+    _ok "配置已保存（编辑前备份: $backup）"
+    echo -e "  ${D}Realm 没有独立的只读校验命令；重启结果就是实际配置校验。${NC}" >&2
+    if svc status "$REALM_SVC" >/dev/null 2>&1 &&
+       _ask_yes "立即重启 Realm 应用配置?"; then
+        if ! realm_restart_service; then
+            _warn "新配置未能启动"
+            if _ask_yes "恢复编辑前配置并重启?"; then
+                cp -a "$backup" "$REALM_CONF"
+                realm_restart_service
+            fi
+        fi
+    fi
+}
+
+realm_export_rules() {
+    local count; count=$(_realm_rule_count)
+    (( count > 0 )) || { _warn "没有可导出的规则"; return 1; }
+    local out
+    read -rp "  导出路径 [默认 /root/realm-rules-时间.txt]: " out
+    out="${out:-/root/realm-rules-$(date '+%Y%m%d-%H%M%S').txt}"
+    mkdir -p "$(dirname "$out")" 2>/dev/null || {
+        _err "无法创建输出目录"; return 1; }
+    {
+        echo "# EZRealm 兼容格式: 序号|本地端口|远程IP:端口|备注"
+        local idx listen remote remark port
+        while IFS=$'\t' read -r idx listen remote remark; do
+            port=$(_realm_listen_port "$listen")
+            printf '%s|%s|%s|%s\n' "$idx" "$port" "$remote" "$remark"
+        done < <(_realm_rules_tsv)
+    } >"$out" || { _err "写入 $out 失败"; return 1; }
+    chmod 600 "$out"
+    _ok "已导出 $count 条规则: $out"
+    echo -e "  ${D}文件格式与 EZRealm 的导入/导出格式兼容。${NC}" >&2
+}
+
+realm_import_rules() {
+    [[ -x "$REALM_BIN" ]] || install_realm_core false || return 1
+    _realm_init_config || return 1
+    local src tmp own_tmp=false
+    read -rp "  导入文件路径 [留空后粘贴，单独输入 END 结束]: " src
+    if [[ -n "$src" ]]; then
+        [[ -f "$src" ]] || { _err "文件不存在: $src"; return 1; }
+        tmp="$src"
+    else
+        tmp=$(mktemp) || return 1
+        own_tmp=true
+        echo -e "  ${D}格式: 序号|本地端口|远程IP:端口|备注${NC}" >&2
+        echo -e "  ${D}例如: 1|8080|192.0.2.10:80|web；粘贴后单独输入 END${NC}" >&2
+        local line
+        while IFS= read -r line; do
+            [[ "$line" == "END" ]] && break
+            printf '%s\n' "$line" >>"$tmp"
+        done
+    fi
+    [[ -s "$tmp" ]] || {
+        [[ "$own_tmp" == "true" ]] && rm -f "$tmp"
+        _warn "没有输入规则"; return 1; }
+    _ask_yes "确认追加导入（不会覆盖现有规则）?" || {
+        [[ "$own_tmp" == "true" ]] && rm -f "$tmp"; return 0; }
+
+    local raw_index local_port remote_addr remark extra
+    local ok=0 skipped=0
+    while IFS='|' read -r raw_index local_port remote_addr remark extra ||
+          [[ -n "$raw_index" ]]; do
+        raw_index="${raw_index//$'\r'/}"
+        [[ "$raw_index" =~ ^[0-9]+$ ]] || continue
+        _is_valid_port "$local_port" || { ((skipped++)); continue; }
+        _realm_parse_remote "$remote_addr" || { ((skipped++)); continue; }
+        _realm_port_in_config "$local_port" && { ((skipped++)); continue; }
+        _port_listening "$local_port" && { ((skipped++)); continue; }
+        _realm_append_rule "$local_port" "$REALM_PARSE_HOST" "$REALM_PARSE_PORT" "$remark" || {
+            ((skipped++)); continue; }
+        allow_port "$local_port" tcp
+        allow_port "$local_port" udp
+        ((ok++))
+    done <"$tmp"
+    [[ "$own_tmp" == "true" ]] && rm -f "$tmp"
+    if (( ok == 0 )); then
+        _err "没有导入有效规则（无效、重复或端口被占用: $skipped）"
+        return 1
+    fi
+    _ok "成功导入 $ok 条规则；跳过 $skipped 条"
+    realm_start_service
+}
+
+_realm_remove_cron() {
+    check_cmd crontab || return 0
+    local tmp; tmp=$(mktemp) || return 1
+    crontab -l 2>/dev/null | grep -v '# vless-realm-restart$' >"$tmp" || true
+    crontab "$tmp" 2>/dev/null
+    rm -f "$tmp"
+}
+
+_realm_set_cron() {
+    local expr="$1"
+    check_cmd crontab || {
+        if check_cmd apk; then
+            apk add --no-cache cronie >/dev/null 2>&1 ||
+                apk add --no-cache dcron >/dev/null 2>&1
+            rc-service cronie start >/dev/null 2>&1 ||
+                rc-service crond start >/dev/null 2>&1 || true
+            rc-update add cronie default >/dev/null 2>&1 ||
+                rc-update add crond default >/dev/null 2>&1 || true
+        elif check_cmd apt-get; then
+            apt-get update >/dev/null 2>&1 &&
+                DEBIAN_FRONTEND=noninteractive apt-get install -y cron >/dev/null 2>&1
+            systemctl enable --now cron >/dev/null 2>&1 || true
+        elif check_cmd yum; then
+            yum install -y cronie >/dev/null 2>&1
+            systemctl enable --now crond >/dev/null 2>&1 || true
+        fi
+    }
+    check_cmd crontab || { _err "crontab 不可用"; return 1; }
+    create_shortcut >/dev/null 2>&1 || true
+    local tmp; tmp=$(mktemp) || return 1
+    crontab -l 2>/dev/null | grep -v '# vless-realm-restart$' >"$tmp" || true
+    echo "$expr /usr/local/bin/vless-server.sh --realm-restart >/dev/null 2>&1 # vless-realm-restart" >>"$tmp"
+    crontab "$tmp" || {
+        rm -f "$tmp"; _err "写入 crontab 失败"; return 1; }
+    rm -f "$tmp"
+}
+
+realm_schedule_menu() {
+    _line
+    echo -e "  ${W}Realm 定时重启${NC}" >&2
+    local current state
+    current=$(crontab -l 2>/dev/null | grep '# vless-realm-restart$' | head -1)
+    if [[ -n "$current" ]]; then state="${G}$current${NC}"
+    else state="${D}未设置${NC}"; fi
+    echo -e "  当前: $state" >&2
+    _line
+    _item "1" "每 N 小时重启"
+    _item "2" "每天固定小时重启"
+    _item "3" "移除定时重启"
+    _item "0" "返回"
+    _line
+    local ch n
+    read -rp "  请选择: " ch
+    case "$ch" in
+        1)
+            read -rp "  间隔小时 [1-23]: " n
+            [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= 23 )) || {
+                _err "小时无效"; return 1; }
+            _realm_set_cron "0 */$n * * *" && _ok "已设置每 $n 小时重启 Realm" ;;
+        2)
+            read -rp "  每天几点 [0-23]: " n
+            [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 0 && n <= 23 )) || {
+                _err "小时无效"; return 1; }
+            _realm_set_cron "0 $n * * *" && _ok "已设置每天 $n:00 重启 Realm" ;;
+        3)
+            _realm_remove_cron && _ok "已移除 Realm 定时重启" ;;
+    esac
+}
+
+realm_uninstall() {
+    local confirmed="${1:-false}"
+    if [[ "$confirmed" != "true" ]]; then
+        _ask_yes "确认卸载 Realm 核心、服务与 $REALM_DIR?" || return 0
+    fi
+    svc stop "$REALM_SVC" >/dev/null 2>&1 || true
+    svc disable "$REALM_SVC" >/dev/null 2>&1 || true
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rm -f "/etc/init.d/$REALM_SVC"
+    else
+        rm -f "/etc/systemd/system/$REALM_SVC.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    _realm_remove_cron >/dev/null 2>&1 || true
+    rm -rf "$REALM_DIR"
+    _ok "Realm 已卸载（核心、配置、服务和定时任务均已删除）"
+}
+
+show_realm_summary() {
+    [[ -x "$REALM_BIN" || -f "$REALM_CONF" ]] || return 0
+    local state rules ver
+    if svc status "$REALM_SVC" >/dev/null 2>&1; then
+        state="${G}● 运行中${NC}"
+    else
+        state="${D}○ 已停止${NC}"
+    fi
+    rules=$(_realm_rule_count)
+    ver=$(_realm_version 2>/dev/null || echo 未安装)
+    echo -e "  Realm: $state  ${D}v$ver / $rules 条转发${NC}" >&2
+}
+
+realm_menu() {
+    while true; do
+        _header
+        echo -e "  ${W}Realm TCP / UDP 端口转发${NC}" >&2
+        echo -e "  ${D}目录: $REALM_DIR${NC}" >&2
+        echo -e "  ${D}配置: $REALM_CONF（可手动编辑）${NC}" >&2
+        local target
+        target=$(_realm_target 2>/dev/null || echo "不支持-$(uname -m)")
+        echo -e "  ${D}系统匹配: $DISTRO / $target${NC}" >&2
+        show_realm_summary
+        _line
+        _item "1" "安装 / 更新 Realm 官方核心"
+        _item "2" "添加转发规则"
+        _item "3" "查看转发规则"
+        _item "4" "修改转发规则"
+        _item "5" "删除转发规则"
+        _item "6" "手动编辑 config.toml ${D}(自动备份/可回滚)${NC}"
+        _item "7" "导入规则 ${D}(兼容 EZRealm 格式)${NC}"
+        _item "8" "导出规则 ${D}(兼容 EZRealm 格式)${NC}"
+        echo -e "  ${D}───────────────────────────────────────────${NC}" >&2
+        _item "9" "启动 Realm"
+        _item "10" "停止 Realm"
+        _item "11" "重启 Realm"
+        _item "12" "查看状态 / 日志"
+        _item "13" "定时重启"
+        _item "14" "卸载 Realm"
+        _item "0" "返回"
+        _line
+        local ch; read -rp "  请选择: " ch
+        case "$ch" in
+            1) install_realm_core true ;;
+            2) realm_add_rule ;;
+            3) realm_show_rules ;;
+            4) realm_modify_rule ;;
+            5) realm_delete_rule ;;
+            6) realm_edit_config ;;
+            7) realm_import_rules ;;
+            8) realm_export_rules ;;
+            9) realm_start_service ;;
+            10) realm_stop_service ;;
+            11) realm_restart_service ;;
+            12) realm_show_logs ;;
+            13) realm_schedule_menu ;;
+            14) realm_uninstall ;;
+            0) return ;;
+            *) _err "无效选择"; sleep 1; continue ;;
+        esac
+        _pause
+    done
+}
+
 do_uninstall() {
     check_installed || { _warn "未安装"; return; }
     _header
@@ -9796,6 +10564,7 @@ do_uninstall() {
 
     _info "停止所有服务..."
     stop_services
+    [[ -x "$REALM_BIN" || -f "$REALM_CONF" ]] && realm_uninstall true
     svc stop nginx 2>/dev/null
 
     if [[ "$(db_get_warp_mode)" != "disabled" ]]; then
@@ -9858,7 +10627,11 @@ do_uninstall() {
 #   meta.txt -> 版本 / 时间 / 主机信息
 do_backup() {
     local out="${1:-}"
-    [[ -f "$DB_FILE" ]] || { _err "未找到 $DB_FILE，没有可备份的配置"; return 1; }
+    if [[ ! -f "$DB_FILE" ]]; then
+        [[ -f "$REALM_CONF" ]] && init_db
+    fi
+    [[ -f "$DB_FILE" ]] || {
+        _err "未找到协议或 Realm 配置，没有可备份的内容"; return 1; }
     check_cmd tar || { _err "缺少 tar 命令"; return 1; }
     if [[ -z "$out" ]]; then
         out="/root/vless-backup-$(hostname -s 2>/dev/null || echo host)-$(date '+%Y%m%d-%H%M%S').tar.gz"
@@ -9871,6 +10644,10 @@ do_backup() {
     for f in db.json warp.json sub_uuid sub.info cert_domain cert_meta dns_api.conf decoy_site_port; do
         [[ -e "$CFG/$f" ]] && cp -a "$CFG/$f" "$tmp/pkg/etc/"
     done
+    if [[ -f "$REALM_CONF" ]]; then
+        mkdir -p "$tmp/pkg/etc/realm"
+        cp -a "$REALM_CONF" "$tmp/pkg/etc/realm/"
+    fi
     [[ -d "$SSL_DIR" ]] && cp -a "$SSL_DIR" "$tmp/pkg/etc/"
     [[ -d "$HOME/.acme.sh" ]] && cp -a "$HOME/.acme.sh" "$tmp/pkg/acme"
 
@@ -9881,6 +10658,7 @@ do_backup() {
         echo "ipv4=$(get_ipv4)"
         echo "ipv6=$(get_ipv6)"
         echo "protocols=$(db_all_protocols | tr '\n' ' ')"
+        echo "realm_rules=$(_realm_rule_count)"
     } >"$tmp/pkg/meta.txt"
 
     if tar -czf "$out" -C "$tmp/pkg" . 2>/dev/null; then
@@ -9891,6 +10669,8 @@ do_backup() {
         echo -e "  文件: ${G}${out}${NC}" >&2
         echo -e "  大小: ${C}$(du -h "$out" | cut -f1)${NC}   SHA256: ${D}$(_sha256_file "$out")${NC}" >&2
         echo -e "  含  : ${C}$(db_all_protocols | tr '\n' ' ')${NC}" >&2
+        [[ -f "$REALM_CONF" ]] &&
+            echo -e "         ${C}Realm $(_realm_rule_count) 条转发规则${NC}" >&2
         _dline
         echo -e "  ${Y}请立刻把它下载到本地（备份内含全部密钥，务必妥善保管）:${NC}" >&2
         echo -e "  ${C}scp root@$(get_ipv4 || echo YOUR_IP):${out} ./${NC}" >&2
@@ -9918,6 +10698,8 @@ do_restore() {
     fi
     jq -e . "$tmp/etc/db.json" >/dev/null 2>&1 || {
         rm -rf "$tmp"; _err "备份中的 db.json 不是合法 JSON"; return 1; }
+    local backup_has_realm=false
+    [[ -s "$tmp/etc/realm/config.toml" ]] && backup_has_realm=true
 
     _line
     echo -e "  ${W}备份包信息${NC}" >&2
@@ -9929,8 +10711,11 @@ do_restore() {
     local avail=() ap
     while IFS= read -r ap; do [[ -n "$ap" ]] && avail+=("$ap"); done < <(
         jq -r '[((.singbox // {}) | keys[]), ((.snell // {}) | keys[])] | sort | .[]' "$bk_db" 2>/dev/null)
-    if [[ ${#avail[@]} -eq 0 ]]; then
-        rm -rf "$tmp"; _err "备份中没有任何协议配置"; return 1
+    if [[ ${#avail[@]} -eq 0 && "$backup_has_realm" != "true" ]]; then
+        rm -rf "$tmp"; _err "备份中没有协议或 Realm 配置"; return 1
+    elif [[ ${#avail[@]} -eq 0 ]]; then
+        keep_csv="all"
+        _info "这是 Realm-only 备份，将恢复 config.toml 并按当前系统重装核心"
     fi
 
     if [[ -z "$keep_csv" && ${#avail[@]} -gt 1 && -t 0 ]]; then
@@ -9999,17 +10784,30 @@ do_restore() {
         _line
     fi
 
-    if [[ -f "$DB_FILE" ]]; then
-        _warn "当前服务器已有配置，恢复会覆盖 db.json / 证书 / WARP / 订阅 UUID"
+    local realm_restore=false
+    if [[ "$backup_has_realm" == "true" && "$keep_csv" == "all" ]]; then
+        realm_restore=true
+    else
+        rm -rf "$tmp/etc/realm"
+    fi
+
+    if [[ -f "$DB_FILE" || -f "$REALM_CONF" ]]; then
+        _warn "当前服务器已有配置，恢复会覆盖 db.json / 证书 / WARP / 订阅 UUID / Realm 配置"
         _ask_yes "确认继续?" || { rm -rf "$tmp"; _info "已取消"; return 0; }
-        cp -a "$DB_FILE" "${DB_FILE}.before-restore.bak" 2>/dev/null &&             _info "原 db.json 已备份为 ${DB_FILE}.before-restore.bak"
+        cp -a "$DB_FILE" "${DB_FILE}.before-restore.bak" 2>/dev/null &&
+            _info "原 db.json 已备份为 ${DB_FILE}.before-restore.bak"
+        [[ -f "$REALM_CONF" ]] &&
+            cp -a "$REALM_CONF" "${REALM_CONF}.before-restore.bak" 2>/dev/null
         stop_services
+        svc stop "$REALM_SVC" >/dev/null 2>&1 || true
     fi
 
     mkdir -p "$CFG"; chmod 711 "$CFG" 2>/dev/null
     cp -a "$tmp/etc/." "$CFG/" || { rm -rf "$tmp"; _err "写入 $CFG 失败"; return 1; }
     chmod 600 "$DB_FILE" 2>/dev/null
     [[ -d "$SSL_DIR" ]] && chmod 700 "$SSL_DIR" 2>/dev/null
+    [[ -d "$REALM_DIR" ]] && chmod 700 "$REALM_DIR" 2>/dev/null
+    [[ -f "$REALM_CONF" ]] && chmod 600 "$REALM_CONF" 2>/dev/null
     if [[ -d "$tmp/acme" ]]; then
         mkdir -p "$HOME/.acme.sh"
         cp -a "$tmp/acme/." "$HOME/.acme.sh/" 2>/dev/null && _info "已恢复 acme.sh 账户与证书状态"
@@ -10028,15 +10826,26 @@ do_restore() {
     fi
 
     _info "重建服务（缺失的内核二进制会自动补装）..."
-    if start_services; then
+    local restore_ok=true
+    start_services || restore_ok=false
+    if [[ "$realm_restore" == "true" ]]; then
+        _info "按当前系统的架构与 libc 重装 Realm 核心..."
+        if ! install_realm_core true; then
+            restore_ok=false
+        elif (( $(_realm_rule_count) > 0 )) && ! realm_start_service; then
+            restore_ok=false
+        fi
+    fi
+    if [[ "$restore_ok" == "true" ]]; then
         create_shortcut
         [[ -f "$CFG/sub.info" ]] && { install_nginx >/dev/null 2>&1 && generate_sub_files; }
         db_expired_users >/dev/null 2>&1 && install_expire_cron >/dev/null 2>&1
         sync_traffic_counters 2>/dev/null || true
         _dline
-        _ok "恢复完成，协议参数与原服务器完全一致"
+        _ok "恢复完成，所选协议与 Realm 配置已重建"
         _dline
         show_status
+        show_realm_summary
         echo "" >&2
         local oip nip
         oip=$(tar -xzOf "$src" ./meta.txt 2>/dev/null | awk -F= '/^ipv4=/{print $2}')
@@ -10105,6 +10914,7 @@ main_menu() {
         echo -e "  ${D}内核: Sing-box $(_sb_version 2>/dev/null || echo 未安装)${NC}" >&2
         echo "" >&2
         show_status
+        show_realm_summary
         echo "" >&2
         _line
 
@@ -10131,8 +10941,13 @@ main_menu() {
             echo -e "  ${D}───────────────────────────────────────────${NC}" >&2
             _item "9" "网络调优 ${D}(BBR3 / 双栈 / NAT / sysctl)${NC}"
             _item "11" "检查脚本更新"
-            _item "14" "从备份恢复配置 ${D}(重装系统后使用)${NC}"
+            if [[ -f "$REALM_CONF" ]]; then
+                _item "14" "备份 / 恢复配置 ${D}(含 Realm config.toml)${NC}"
+            else
+                _item "14" "从备份恢复配置 ${D}(重装系统后使用)${NC}"
+            fi
         fi
+        _item "15" "Realm 端口转发 ${D}(TCP/UDP / Debian/Alpine)${NC}"
         _item "0" "退出"
         _line
 
@@ -10153,14 +10968,14 @@ main_menu() {
             12) [[ -n "$installed" ]] && do_uninstall || _err "无效选择" ;;
             13) [[ -n "$installed" ]] && { manage_certificates; skip=true; } || _err "无效选择" ;;
             14)
-                if [[ -z "$installed" ]]; then
+                if [[ -z "$installed" && ! -f "$REALM_CONF" ]]; then
                     do_restore ""
                 elif true; then
                     _header
                     echo -e "  ${W}备份 / 恢复配置${NC}" >&2
                     _line
                     _item "1" "备份当前配置 ${D}(重装系统前导出)${NC}"
-                    _item "2" "从备份恢复 ${D}(可只恢复部分协议)${NC}"
+                        _item "2" "从备份恢复 ${D}(可只恢复部分协议；完整恢复含 Realm)${NC}"
                     _item "0" "返回"
                     _line
                     local bc; read -rp "  请选择: " bc
@@ -10172,6 +10987,7 @@ main_menu() {
                 else
                     _err "无效选择"
                 fi ;;
+            15) realm_menu; skip=true ;;
             0)  exit 0 ;;
             *)  _err "无效选择"; skip=true; sleep 1 ;;
         esac
@@ -10205,6 +11021,8 @@ case "${1:-}" in
         check_root; init_db; cert_adopt; cert_ensure_autorenew; exit $? ;;
     --cert-status)
         check_root; init_db; cert_selfheal; show_cert_status; cert_show_renew_task; exit 0 ;;
+    --realm-restart)
+        check_root; init_log; realm_restart_service; exit $? ;;
     --backup)
         check_root; init_log; do_backup "${2:-}"; exit $? ;;
     --restore)
@@ -10237,7 +11055,8 @@ case "${1:-}" in
   --firewall-status 审计本脚本写入的防火墙规则
   --firewall-status 审计脚本写入了哪些防火墙规则
   --cert-fix        重新识别现有证书并补齐自动续期链路（恢复备份后用）
-  --backup [路径]   导出配置备份（含全部协议参数、用户、证书），重装系统前使用
+  --realm-restart   重启 Realm 服务（供定时任务调用）
+  --backup [路径]   导出配置备份（含协议、用户、证书及 Realm 配置），重装前使用
   --restore <文件> [--only p1,p2]
                     从备份恢复并重建服务；--only 可只恢复指定协议
   --list-backup <文件>
