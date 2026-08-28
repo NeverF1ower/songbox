@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  songbox v0.1.0 [Sing-box 统一内核]
+#  songbox v0.1.1 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -25,10 +25,10 @@ fi
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.1.1"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="songbox"
-readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm"
+readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（保留 VLESS_* 环境变量，兼容已安装的旧版本）
@@ -4058,6 +4058,7 @@ manage_tfo() {
         db_set_inst_field "$core" "$p" all tcp_fast_open "$want"
     done
     reload_config
+    _refresh_subscription_files
     _ok "$([[ "$want" == "1" ]] && echo "已开启" || echo "已关闭") TFO: ${targets[*]}"
     [[ "$want" == "1" ]] && _warn "若出现间歇性连接失败，回来这里关掉即可"
     _pause
@@ -7743,8 +7744,8 @@ cert_issue_new() {
         fi
     fi
     reload_config
-    # SNI/证书变了，订阅文件里的内容也必须跟着重生成，否则客户端拉到的还是旧的
-    [[ -f "$CFG/sub.info" ]] && generate_sub_files
+    # SNI/证书变了，订阅文件里的内容也必须跟着重生成，否则客户端拿到的还是旧值。
+    _refresh_subscription_files
     _ok "证书配置完成"
     echo "" >&2
     _line
@@ -7752,6 +7753,8 @@ cert_issue_new() {
     echo -e "  ${C}1.${NC} 「查看协议配置 / 分享链接」重新导出链接给客户端" >&2
     if [[ -f "$CFG/sub.info" ]]; then
         echo -e "  ${C}2.${NC} 订阅已重新生成，客户端刷新订阅即可" >&2
+    else
+        echo -e "  ${C}2.${NC} 本地订阅文件已重新生成；需要远程拉取时再启用订阅服务" >&2
     fi
     echo -e "  ${C}3.${NC} ${D}客户端的 insecure / 跳过证书验证 现在可以关掉了${NC}" >&2
     _line
@@ -7853,7 +7856,7 @@ cert_force_renew() {
         _meta_set issued_at "$(date '+%F %T')"
         cert_ensure_autorenew true
         reload_config
-        [[ -f "$CFG/sub.info" ]] && generate_sub_files
+        _refresh_subscription_files
         show_cert_status
     else
         _err "续期后证书仍异常，请检查 $HOME/.acme.sh/acme.sh.log"
@@ -7882,6 +7885,7 @@ cert_gen_self() {
         local c; c=$(_sync_protocols_sni "$d"); _ok "已更新 ${c} 个协议"
     fi
     reload_config
+    _refresh_subscription_files
     _ok "自签证书已生成: $d"
 }
 
@@ -8046,6 +8050,7 @@ manage_certificates() {
                         local n; n=$(_cert_protocols_installed | grep -c .)
                         [[ "${n:-0}" -gt 0 ]] && _ask_yes "同步 ${n} 个协议的 SNI 为 ${d}?" && _sync_protocols_sni "$d" >/dev/null
                         reload_config
+                        _refresh_subscription_files
                         _ok "证书已导入并生效: $d"
                     fi
                 fi
@@ -8140,7 +8145,7 @@ manage_certificates() {
                     else _ok "已把 ${changed} 个协议的连接地址设为 ${cur_addr}"; fi
                 fi
                 reload_config
-                [[ -f "$CFG/sub.info" ]] && generate_sub_files
+                _refresh_subscription_files
                 _warn "分享链接与订阅已重新生成，请让客户端重新拉取"
                 _pause ;;
             0) return ;;
@@ -8814,7 +8819,7 @@ do_install() {
     if start_services; then
         create_shortcut
         sync_traffic_counters 2>/dev/null || true
-        [[ -f "$CFG/sub.info" ]] && generate_sub_files
+        _refresh_subscription_files
         _dline
         _ok "安装完成：成功 ${#ok_list[@]} 个$( [[ ${#skip_list[@]} -gt 0 ]] && echo " / 跳过 ${#skip_list[@]} 个" )$( [[ ${#fail_list[@]} -gt 0 ]] && echo " / 失败 ${#fail_list[@]} 个" )"
         _dline
@@ -8908,7 +8913,7 @@ uninstall_specific_protocol() {
         reload_config
     fi
     sync_traffic_counters 2>/dev/null || true
-    [[ -f "$CFG/sub.info" ]] && generate_sub_files
+    _refresh_subscription_files
     _ok "卸载完成"
     _pause
 }
@@ -9026,7 +9031,7 @@ _add_user() {
         _ok "用户 $name 已添加"
         [[ -n "$expire" ]] && install_expire_cron
         reload_config
-        [[ -f "$CFG/sub.info" ]] && generate_sub_files
+        _refresh_subscription_files
     else
         _err "添加失败"
     fi
@@ -9091,7 +9096,10 @@ check_and_disable_expired() {
         echo "[$(date '+%F %T')] 禁用过期用户: $name ($proto, 到期 $exp)" >>"$CFG/expire.log"
         ((count++))
     done < <(db_expired_users)
-    [[ "$count" -gt 0 ]] && reload_config
+    if [[ "$count" -gt 0 ]]; then
+        reload_config
+        _refresh_subscription_files
+    fi
     echo "$count"
 }
 
@@ -9131,7 +9139,7 @@ manage_users() {
                 if _ask_yes "确认删除用户 $u?"; then
                     db_del_user "$SELECTED_CORE" "$SELECTED_PROTO" "$u"
                     _ok "已删除"; reload_config
-                    [[ -f "$CFG/sub.info" ]] && generate_sub_files
+                    _refresh_subscription_files
                 fi
                 _pause ;;
             4)
@@ -9152,7 +9160,7 @@ manage_users() {
                 else
                     db_set_user_enabled "$SELECTED_CORE" "$SELECTED_PROTO" "$u" true; _ok "$u 已启用"
                 fi
-                reload_config; _pause ;;
+                reload_config; _refresh_subscription_files; _pause ;;
             6)
                 _select_protocol_for_users || continue
                 _show_users_list "$SELECTED_CORE" "$SELECTED_PROTO"
@@ -9187,9 +9195,47 @@ manage_users() {
 # 订阅服务
 #═══════════════════════════════════════════════════════════════════════════════
 get_sub_uuid() {
-    local f="$CFG/sub_uuid"
-    [[ -f "$f" ]] && { cat "$f"; return; }
-    local u; u=$(gen_uuid); echo "$u" >"$f"; chmod 600 "$f"; echo "$u"
+    local f="$CFG/sub_uuid" u tmp
+    if [[ -f "$f" ]]; then
+        u=$(head -1 "$f" 2>/dev/null | tr -d '\r\n')
+        if [[ "$u" =~ ^[0-9a-fA-F-]{16,64}$ ]]; then
+            echo "$u"
+            return 0
+        fi
+        _warn "订阅 UUID 文件无效，将安全地重新生成"
+    fi
+    u=$(gen_uuid)
+    [[ "$u" =~ ^[0-9a-fA-F-]{16,64}$ ]] || { _err "订阅 UUID 生成失败"; return 1; }
+    mkdir -p "$CFG" || return 1
+    tmp=$(mktemp "${f}.new.XXXXXX") || return 1
+    if printf '%s\n' "$u" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f"; then
+        echo "$u"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+_subscription_files_current() {
+    local uuid dir f
+    [[ -f "$CFG/sub_uuid" ]] || return 1
+    uuid=$(head -1 "$CFG/sub_uuid" 2>/dev/null | tr -d '\r\n')
+    [[ "$uuid" =~ ^[0-9a-fA-F-]{16,64}$ ]] || return 1
+    dir="$CFG/subscription/$uuid"
+    for f in base64 clash.yaml surge.conf; do
+        [[ -f "$dir/$f" ]] || return 1
+        [[ -f "$DB_FILE" && "$DB_FILE" -nt "$dir/$f" ]] && return 1
+        [[ -f "$NODE_NAME_FILE" && "$NODE_NAME_FILE" -nt "$dir/$f" ]] && return 1
+        [[ -f "$SSL_DIR/server.crt" && "$SSL_DIR/server.crt" -nt "$dir/$f" ]] && return 1
+    done
+    return 0
+}
+
+ensure_subscription_files() {
+    [[ -n "$(db_all_protocols)" ]] || return 0
+    _subscription_files_current && return 0
+    _info "补齐或刷新本地订阅文件..."
+    _refresh_subscription_files
 }
 
 _all_share_links_plain() {
@@ -9450,15 +9496,37 @@ EOF
 }
 
 generate_sub_files() {
-    local uuid dir
-    uuid=$(get_sub_uuid); dir="$CFG/subscription/$uuid"
-    mkdir -p "$dir"
+    local uuid dir stage f
+    uuid=$(get_sub_uuid) || return 1
+    dir="$CFG/subscription/$uuid"
+    mkdir -p "$CFG/subscription" "$dir" || { _err "无法创建订阅目录"; return 1; }
     chmod 711 "$CFG/subscription" "$dir" 2>/dev/null
-    gen_v2ray_sub >"$dir/base64"
-    gen_clash_sub >"$dir/clash.yaml"
-    gen_surge_sub >"$dir/surge.conf"
-    chmod 644 "$dir"/* 2>/dev/null
+    stage=$(mktemp -d "$CFG/subscription/.generate.XXXXXX") || {
+        _err "无法创建订阅文件暂存目录"; return 1; }
+    if ! gen_v2ray_sub >"$stage/base64" ||
+       ! gen_clash_sub >"$stage/clash.yaml" ||
+       ! gen_surge_sub >"$stage/surge.conf"; then
+        rm -rf "$stage"
+        _err "订阅内容生成失败，原文件保持不变"
+        return 1
+    fi
+    chmod 644 "$stage"/* 2>/dev/null || {
+        rm -rf "$stage"; _err "订阅文件权限设置失败"; return 1; }
+    # 三个文件均生成成功后再逐个原子替换，避免生成中途留下空文件。
+    for f in base64 clash.yaml surge.conf; do
+        mv -f "$stage/$f" "$dir/$f" || {
+            rm -rf "$stage"; _err "订阅文件写入失败: $f"; return 1; }
+    done
+    rm -rf "$stage"
     _ok "订阅文件已生成"
+}
+
+# 本地订阅文件与 Nginx 是否公开访问完全解耦。协议/用户/证书变更后统一调用；
+# 刷新失败只告警，不回滚已经成功生效的协议配置。
+_refresh_subscription_files() {
+    generate_sub_files && return 0
+    _warn "协议配置已生效，但订阅文件刷新失败；可在 [订阅服务管理] 中重试"
+    return 0
 }
 
 _write_sub_info() {
@@ -9500,8 +9568,9 @@ setup_subscription() {
     _line
     install_nginx || { _pause; return 1; }
 
-    if [[ -f "$CFG/sub_uuid" ]] && _ask_yes "检测到已有订阅 UUID，是否重新生成（旧链接失效）?"; then
-        local old; old=$(cat "$CFG/sub_uuid")
+    if [[ -f "$CFG/sub.info" && -f "$CFG/sub_uuid" ]] &&
+       _ask_yes "检测到已有订阅服务，是否重新生成 UUID（旧链接失效）?"; then
+        local old; old=$(get_sub_uuid) || return 1
         rm -rf "$CFG/subscription/$old" "$CFG/sub_uuid"
         _ok "订阅 UUID 已重置"
     fi
@@ -9521,7 +9590,7 @@ setup_subscription() {
     local https="true"
     _ask_yes "启用 HTTPS?（自签证书部分客户端可能无法拉取，可选 n 用 HTTP）" || https="false"
 
-    generate_sub_files
+    generate_sub_files || return 1
     local uuid dir conf_dir conf
     uuid=$(get_sub_uuid); dir="$CFG/subscription/$uuid"
     conf_dir="/etc/nginx/conf.d"; [[ -d /etc/nginx/http.d ]] && conf_dir="/etc/nginx/http.d"
@@ -9607,8 +9676,15 @@ manage_subscription() {
             _item "5" "节点命名设置 ${D}(当前: $(_node_label vless-reality "$(get_ip_country "$(get_ipv4)")" ""))${NC}"
         else
             echo -e "  状态: ${D}未配置${NC}" >&2
+            if _subscription_files_current; then
+                local local_uuid; local_uuid=$(head -1 "$CFG/sub_uuid")
+                echo -e "  本地文件: ${G}已生成并自动维护${NC}   ${D}${CFG}/subscription/${local_uuid}${NC}" >&2
+            else
+                echo -e "  本地文件: ${Y}缺失或需要刷新${NC}" >&2
+            fi
             _line
             _item "1" "启用订阅服务"
+            _item "2" "立即更新本地订阅文件"
             _item "5" "节点命名设置 ${D}(当前: $(_node_label vless-reality "$(get_ip_country "$(get_ipv4)")" ""))${NC}"
         fi
         _item "0" "返回"
@@ -9622,17 +9698,18 @@ manage_subscription() {
                 5) set_node_name; _pause ;;
                 4)
                     rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf "$CFG/sub.info"
-                    rm -rf "$CFG/subscription"
                     local others; others=$(ls /etc/nginx/conf.d/*.conf /etc/nginx/http.d/*.conf 2>/dev/null | wc -l)
                     if [[ "$others" -eq 0 ]]; then svc stop nginx 2>/dev/null; _info "Nginx 已停止"
                     else nginx -s reload >/dev/null 2>&1; fi
-                    _ok "订阅服务已停用"; _pause ;;
+                    _refresh_subscription_files
+                    _ok "订阅服务已停用；本地订阅文件仍会自动维护"; _pause ;;
                 0) return ;;
                 *) _err "无效选择"; sleep 1 ;;
             esac
         else
             case "$ch" in
                 1) setup_subscription; _pause ;;
+                2) _refresh_subscription_files; _pause ;;
                 5) set_node_name; _pause ;;
                 0) return ;;
                 *) _err "无效选择"; sleep 1 ;;
@@ -9667,7 +9744,7 @@ set_node_name() {
         _ok "节点名已设为: ${new}"
     fi
     echo -e "  新效果: ${C}$(_node_label vless-reality "$cc" "")${NC}" >&2
-    [[ -f "$CFG/sub.info" ]] && generate_sub_files
+    _refresh_subscription_files
     _warn "请重新导出分享链接，或让客户端刷新订阅"
 }
 
@@ -9697,7 +9774,7 @@ manage_protocol_services() {
             1) restart_all_services && _ok "所有服务已重启"; _pause ;;
             2) stop_services; touch "$CFG/paused"; _ok "所有服务已停止"; _pause ;;
             3) start_services && _ok "所有服务已启动"; _pause ;;
-            4) generate_singbox_config && reload_config; _pause ;;
+            4) generate_singbox_config && reload_config && _refresh_subscription_files; _pause ;;
             5)
                 if [[ -f "$SB_CONFIG" ]]; then
                     ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true \
@@ -9770,7 +9847,7 @@ manage_handshake_sni() {
     else
         reload_config
     fi
-    [[ -f "$CFG/sub.info" ]] && generate_sub_files
+    _refresh_subscription_files
     _ok "已改为 ${newsni}"
     _warn "请重新导出分享链接给客户端，或让客户端刷新订阅"
     show_single_protocol_info "$proto" false ""
@@ -9849,6 +9926,7 @@ update_core_menu() {
                 if install_singbox true; then
                     generate_singbox_config >/dev/null 2>&1
                     [[ "$was" == "true" ]] && svc start "$SB_SVC"
+                    _refresh_subscription_files
                     _ok "Sing-box 更新完成"
                 else
                     [[ "$was" == "true" ]] && svc start "$SB_SVC"
@@ -9859,12 +9937,15 @@ update_core_menu() {
                 local v; read -rp "  请输入版本号 (如 1.12.0): " v
                 [[ -z "$v" ]] && { _pause; continue; }
                 local was=false; svc status "$SB_SVC" >/dev/null 2>&1 && { was=true; svc stop "$SB_SVC"; }
-                install_singbox true "$v" && generate_singbox_config >/dev/null 2>&1
+                install_singbox true "$v" && {
+                    generate_singbox_config >/dev/null 2>&1
+                    _refresh_subscription_files
+                }
                 [[ "$was" == "true" ]] && svc start "$SB_SVC"
                 _pause ;;
-            3) rm -f /usr/local/bin/snell-server; install_snell; restart_all_services >/dev/null; _pause ;;
-            4) rm -f /usr/local/bin/snell-server-v5; install_snell_v5; restart_all_services >/dev/null; _pause ;;
-            5) rm -f /usr/local/bin/snell-server-v6; install_snell_v6; restart_all_services >/dev/null; _pause ;;
+            3) rm -f /usr/local/bin/snell-server; install_snell; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
+            4) rm -f /usr/local/bin/snell-server-v5; install_snell_v5; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
+            5) rm -f /usr/local/bin/snell-server-v6; install_snell_v6; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
             0) return ;;
             *) _err "无效选择"; sleep 1 ;;
         esac
@@ -11384,7 +11465,8 @@ do_restore() {
     fi
     if [[ "$restore_ok" == "true" ]]; then
         create_shortcut
-        [[ -f "$CFG/sub.info" ]] && { install_nginx >/dev/null 2>&1 && generate_sub_files; }
+        _refresh_subscription_files
+        [[ -f "$CFG/sub.info" ]] && install_nginx >/dev/null 2>&1
         if [[ "$backup_has_site" == "true" && -s "$SITE_PORT_FILE" ]]; then
             local restored_site_port; restored_site_port=$(cat "$SITE_PORT_FILE" 2>/dev/null)
             if _is_real_cert; then
@@ -11474,6 +11556,7 @@ main_menu() {
     init_db
     db_migrate_legacy
     cert_selfheal
+    ensure_subscription_files
     _auto_sync_system_script
 
     while true; do
@@ -11582,7 +11665,11 @@ case "${1:-}" in
     --regen-config)
         check_root; init_db
         gen_hop_nat_script
-        generate_singbox_config && { create_singbox_service; svc restart "$SB_SVC" 2>/dev/null; }
+        generate_singbox_config && {
+            create_singbox_service
+            svc restart "$SB_SVC" 2>/dev/null
+            _refresh_subscription_files
+        }
         exit 0 ;;
     --show-traffic)
         check_root; init_db; sync_traffic_counters; show_port_traffic; exit 0 ;;

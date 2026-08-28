@@ -22,6 +22,7 @@ source "$ROOT_DIR/songbox.sh"
 count=0
 while read -r digest filename; do
     [[ -z "$digest" || "$digest" == \#* ]] && continue
+    filename="${filename%$'\r'}"
     [[ "$filename" =~ ^html([1-9])\.zip$ ]] || fail "invalid manifest filename: $filename"
     n="${BASH_REMATCH[1]}"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || fail "invalid manifest digest: $filename"
