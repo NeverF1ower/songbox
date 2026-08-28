@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  SingBox 万能工具箱 v0.0.5 [Sing-box 统一内核]
+#  songbox v0.1.0 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -25,18 +25,22 @@ fi
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.0.5"
+readonly VERSION="0.1.0"
 readonly AUTHOR="NeverF1ower"
-readonly SCRIPT_NAME="SingBox 万能工具箱"
-readonly CUSTOM_BUILD="alpine-sysctl+realm"
+readonly SCRIPT_NAME="songbox"
+readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm"
 
 #───────────────────────────────────────────────────────────────────────────────
-# 脚本更新地址（可用环境变量 VLESS_SCRIPT_RAW_URL / VLESS_REPO_URL 临时覆盖）
+# 脚本更新地址（保留 VLESS_* 环境变量，兼容已安装的旧版本）
 #───────────────────────────────────────────────────────────────────────────────
-SCRIPT_RAW_URL="${VLESS_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/songbox.sh}"
-REPO_URL="${VLESS_REPO_URL:-https://github.com/NeverF1ower/SingsongBox}"
+SCRIPT_RAW_URL="${SONGBOX_SCRIPT_RAW_URL:-${VLESS_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/NeverF1ower/songbox/main/songbox.sh}}"
+REPO_URL="${SONGBOX_REPO_URL:-${VLESS_REPO_URL:-https://github.com/NeverF1ower/songbox}}"
+readonly LEGACY_SCRIPT_RAW_URL="https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/songbox.sh"
+readonly SYSTEM_SCRIPT="${SONGBOX_SYSTEM_SCRIPT:-/usr/local/bin/songbox.sh}"
+readonly LEGACY_SYSTEM_SCRIPT="${SONGBOX_LEGACY_SYSTEM_SCRIPT:-/usr/local/bin/vless-server.sh}"
 
-readonly CFG="/etc/vless-reality"
+# SONGBOX_CFG_DIR 仅用于隔离测试；正常安装仍沿用旧目录，保证原 VPS 无缝升级。
+readonly CFG="${SONGBOX_CFG_DIR:-/etc/vless-reality}"
 readonly DB_FILE="$CFG/db.json"
 readonly DB_LOCK_FILE="$CFG/.db.lock"
 readonly SB_CONFIG="$CFG/singbox.json"
@@ -286,12 +290,53 @@ ensure_dual_stack_listen() {
     sysctl -p /etc/sysctl.d/99-vless-dualstack.conf >/dev/null 2>&1
 }
 
+_has_ipv4_network() {
+    if check_cmd ip; then
+        ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' &&
+            ip -4 route show default 2>/dev/null | grep -q '^default' && return 0
+    fi
+    # /proc/net/route 的目标 00000000 表示 IPv4 默认路由；不依赖 ping/curl。
+    local dest flags
+    while read -r _ dest _ flags _; do
+        [[ "$dest" == "00000000" && "$flags" =~ ^[0-9A-Fa-f]+$ ]] || continue
+        (( (16#$flags & 1) != 0 )) && return 0
+    done </proc/net/route 2>/dev/null
+    return 1
+}
+
+_has_ipv6_network() {
+    if check_cmd ip; then
+        ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' &&
+            ip -6 route show default 2>/dev/null | grep -q '^default' && return 0
+    fi
+    [[ -s /proc/net/if_inet6 ]] && grep -qE '^00000000000000000000000000000000[[:space:]]' \
+        /proc/net/ipv6_route 2>/dev/null
+}
+
 configure_dns64() {
-    ping -c 1 -W 2 8.8.8.8 &>/dev/null && return 0
-    _warn "检测到纯 IPv6 环境，配置 DNS64..."
-    [[ -f /etc/resolv.conf && ! -f /etc/resolv.conf.bak ]] && cp /etc/resolv.conf /etc/resolv.conf.bak
-    printf 'nameserver 2a00:1098:2b::1\nnameserver 2001:4860:4860::6464\n' >/etc/resolv.conf
-    _ok "DNS64 已配置"
+    _has_ipv4_network && return 0
+    if ! _has_ipv6_network; then
+        _warn "无法确认当前为纯 IPv6 网络，跳过 DNS64 自动配置"
+        return 0
+    fi
+
+    # resolv.conf 常由 systemd-resolved、NetworkManager 或容器运行时管理。
+    # 覆盖符号链接会破坏系统 DNS，因此只处理普通文件。
+    if [[ -L /etc/resolv.conf || ! -f /etc/resolv.conf ]]; then
+        _warn "检测到纯 IPv6 网络，但 /etc/resolv.conf 由系统管理，未自动覆盖"
+        echo -e "  ${D}请在网络管理器中配置支持 DNS64 的解析器后重试${NC}" >&2
+        return 0
+    fi
+
+    grep -qE '^nameserver[[:space:]]+(2a00:1098:2b::1|2001:4860:4860::6464)([[:space:]]|$)' \
+        /etc/resolv.conf 2>/dev/null && return 0
+    _warn "确认当前为纯 IPv6 网络，准备配置 DNS64..."
+    [[ ! -e /etc/resolv.conf.songbox.bak ]] && cp -a /etc/resolv.conf /etc/resolv.conf.songbox.bak
+    printf 'nameserver 2a00:1098:2b::1\nnameserver 2001:4860:4860::6464\n' >/etc/resolv.conf || {
+        _err "DNS64 配置失败，原文件未删除"
+        return 1
+    }
+    _ok "DNS64 已配置（原文件: /etc/resolv.conf.songbox.bak）"
 }
 
 sync_time() {
@@ -335,6 +380,14 @@ ask_password() {
         _err "${prompt}只能包含字母、数字及 . _ ~ ! @ % + = , -"
     done
     echo "$pw"
+}
+
+# 敏感值统一关闭终端回显；读取结果只写入指定变量，不写日志、不打印。
+_read_secret() {  # _read_secret <变量名> <提示>
+    local var_name="$1" prompt="$2" value=""
+    IFS= read -rsp "$prompt" value
+    echo "" >&2
+    printf -v "$var_name" '%s' "$value"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -420,9 +473,10 @@ gen_sni() {
 }
 
 gen_ws_path() {
-    local p="/$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
-    [[ -z "$p" || "$p" == "/" ]] && p="/ws$(printf '%04x' $RANDOM)"
-    echo "$p"
+    local ws_path
+    ws_path="/$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 8)"
+    [[ -z "$ws_path" || "$ws_path" == "/" ]] && ws_path="/ws$(printf '%04x' $RANDOM)"
+    echo "$ws_path"
 }
 
 urlencode() {
@@ -458,7 +512,7 @@ gen_port() {
     local port attempt=0
     while [[ $attempt -lt 100 ]]; do
         port=$(shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50000 + 10000)))
-        if ! ss -tuln 2>/dev/null | grep -qE ":$port[^0-9]"; then echo "$port"; return 0; fi
+        if ! ss -tuln 2>/dev/null | grep -qE ":${port}[^0-9]"; then echo "$port"; return 0; fi
         ((attempt++))
     done
     echo "$port"
@@ -481,33 +535,53 @@ _sha256_file() {
 }
 
 _archive_safe() {  # _archive_safe <file> <zip|tar.gz>
-    local f="$1" kind="$2" entries e
+    local f="$1" kind="$2" entries details e type
     case "$kind" in
         zip) entries=$(unzip -Z1 "$f" 2>/dev/null) || return 1 ;;
-        tar.gz) entries=$(tar -tzf "$f" 2>/dev/null) || return 1 ;;
+        tar.gz)
+            # tar -tf/-xf 可按文件魔数自动识别 gzip，也兼容旧版未压缩 .tar 备份。
+            entries=$(tar -tf "$f" 2>/dev/null) || return 1
+            details=$(tar -tvf "$f" 2>/dev/null) || return 1
+            while IFS= read -r e; do
+                type="${e:0:1}"
+                case "$type" in l|h|b|c|p|s) return 1 ;; esac
+            done <<<"$details"
+            ;;
         *) return 1 ;;
     esac
     while IFS= read -r e; do
-        case "$e" in /*|../*|*/../*|*/..) return 1 ;; esac
+        [[ "$e" == *$'\r'* || "$e" == *$'\n'* ]] && return 1
+        case "$e" in /*|../*|*/../*|*/..|..|*\\*) return 1 ;; esac
     done <<<"$entries"
+}
+
+_tree_safe() {  # 解包后拒绝链接、设备、FIFO、socket 与 setuid/setgid 文件
+    local root="$1" bad
+    [[ -d "$root" ]] || return 1
+    bad=$(find "$root" \( -type l -o -type b -o -type c -o -type p -o -type s -o \
+        \( -type f \( -perm -4000 -o -perm -2000 \) \) \) -print -quit 2>/dev/null)
+    [[ -z "$bad" ]]
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
 # 依赖安装
 #═══════════════════════════════════════════════════════════════════════════════
 check_dependencies() {
+    local install_optional="${1:-true}"
     configure_dns64
     local missing=() cmd
-    for cmd in curl jq openssl; do check_cmd "$cmd" || missing+=("$cmd"); done
+    for cmd in curl jq openssl ip ss iptables tar unzip; do check_cmd "$cmd" || missing+=("$cmd"); done
     check_cmd crontab || missing+=("cron")
-    check_cmd iptables || missing+=("iptables")
-    [[ ${#missing[@]} -eq 0 ]] && { _install_optional_tools; return 0; }
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        [[ "$install_optional" == "true" ]] && _install_optional_tools
+        return 0
+    fi
 
     _info "安装缺失依赖: ${missing[*]}"
     case "$DISTRO" in
         alpine)
             apk update >/dev/null 2>&1
-            apk add --no-cache curl jq openssl coreutils ca-certificates gawk unzip \
+            apk add --no-cache curl jq openssl coreutils ca-certificates gawk tar unzip \
                 iproute2 iptables ip6tables gcompat libc6-compat xz bind-tools >/dev/null 2>&1
             check_cmd crontab || apk add --no-cache cronie >/dev/null 2>&1 || apk add --no-cache dcron >/dev/null 2>&1
             rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
@@ -515,21 +589,23 @@ check_dependencies() {
             ;;
         centos)
             yum install -y epel-release >/dev/null 2>&1
-            yum install -y curl jq openssl ca-certificates cronie unzip iproute iptables xz bind-utils >/dev/null 2>&1
+            yum install -y curl jq openssl ca-certificates cronie tar unzip iproute iptables xz bind-utils >/dev/null 2>&1
             systemctl enable --now crond >/dev/null 2>&1 || true
             ;;
         debian|ubuntu)
             apt-get update -qq >/dev/null 2>&1
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates \
-                cron unzip iproute2 iptables xz-utils dnsutils >/dev/null 2>&1
+                cron tar unzip iproute2 iptables xz-utils dnsutils >/dev/null 2>&1
             systemctl enable --now cron >/dev/null 2>&1 || true
             ;;
     esac
-    for cmd in curl jq openssl; do
+    for cmd in curl jq openssl ip ss iptables tar unzip; do
         check_cmd "$cmd" || { _err "依赖安装失败: $cmd"; return 1; }
     done
+    check_cmd crontab || _warn "计划任务工具未安装，证书续期与过期用户清理将不可用"
     _ok "依赖安装完成"
-    _install_optional_tools
+    [[ "$install_optional" == "true" ]] && _install_optional_tools
+    return 0
 }
 
 _install_optional_tools() {
@@ -633,8 +709,8 @@ _db_q() { [[ -f "$DB_FILE" ]] || return 1; jq -r "$@" "$DB_FILE" 2>/dev/null; }
 # 协议注册
 #───────────────────────────────────────────────────────────────────────────────
 proto_core() {
-    local p="$1"
-    [[ " $SNELL_PROTOCOLS " == *" $p "* ]] && { echo "snell"; return; }
+    local proto_id="$1"
+    [[ " $SNELL_PROTOCOLS " == *" $proto_id "* ]] && { echo "snell"; return; }
     echo "singbox"
 }
 
@@ -1125,7 +1201,9 @@ db_migrate_legacy() {
       ((.xray // {}) + (.snell // {}) + (.singbox // {})) as $old
       | ($old | to_entries
            | map(select($m[.key] != null))
-           | map({key: $m[.key], value: (.value | norm | normusers | fixbackend)})) as $mapped
+           | map({key: $m[.key], value: (.value | norm | normusers | fixbackend)})
+           | group_by(.key)
+           | map({key: .[0].key, value: (map(.value) | add)})) as $mapped
       # 注意: 必须先把 .key 绑到 $k，否则 `$sn | index(.key)` 里的 . 已变成 $sn
       | .singbox = ([$mapped[] | select(.key as $k | ($sn | index($k)) == null)] | from_entries)
       | .snell   = ([$mapped[] | select(.key as $k | ($sn | index($k)) != null)] | from_entries)
@@ -1182,12 +1260,16 @@ _verify_sha256() {  # file expected
 }
 
 _sb_version() {
-    check_cmd sing-box || { echo ""; return; }
-    sing-box version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)?' | head -1
+    [[ -x "$SB_BIN" ]] || { echo ""; return; }
+    "$SB_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)?' | head -1
 }
 
 _version_ge() {  # _version_ge a b -> a >= b
-    local IFS=. i; local -a A=(${1//[^0-9.]/}) B=(${2//[^0-9.]/})
+    local i raw_a raw_b
+    local -a A=() B=()
+    raw_a="${1//[^0-9.]/}"; raw_b="${2//[^0-9.]/}"
+    IFS='.' read -r -a A <<<"$raw_a"
+    IFS='.' read -r -a B <<<"$raw_b"
     for ((i=0; i<${#A[@]} || i<${#B[@]}; i++)); do
         local x=${A[i]:-0} y=${B[i]:-0}
         ((10#$x > 10#$y)) && return 0
@@ -1331,6 +1413,7 @@ _install_snell_generic() {  # version target_bin
     fi
     _archive_safe "$tmp/s.zip" zip && unzip -oq "$tmp/s.zip" -d "$tmp" || {
         rm -rf "$tmp"; _err "Snell 压缩包无效"; return 1; }
+    _tree_safe "$tmp" || { rm -rf "$tmp"; _err "Snell 压缩包含链接或特殊文件"; return 1; }
     [[ -f "$tmp/snell-server" ]] || { rm -rf "$tmp"; _err "压缩包内未找到 snell-server"; return 1; }
     install -m 755 "$tmp/snell-server" "$tmp/staged" || { rm -rf "$tmp"; return 1; }
     _prepare_snell_binary "$tmp/staged" || { rm -rf "$tmp"; _err "Snell 兼容处理失败"; return 1; }
@@ -1575,7 +1658,7 @@ _ca_display() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 非自签即视为 CA 签发（issuer != subject）
 _is_real_cert() {
-    local crt="${1:-$SSL_DIR/server.crt}"
+    local crt="$SSL_DIR/server.crt"
     [[ -s "$crt" ]] || return 1
     local issuer subject
     issuer=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null | sed 's/^issuer= *//')
@@ -1616,7 +1699,7 @@ _cert_covers() {
 
 # 证书剩余天数（输出整数，可能为负）
 _cert_days_left() {
-    local crt="${1:-$SSL_DIR/server.crt}" na exp now
+    local crt="$SSL_DIR/server.crt" na exp now
     [[ -s "$crt" ]] || return 1
     na=$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2)
     [[ -z "$na" ]] && return 1
@@ -1627,16 +1710,16 @@ _cert_days_left() {
 
 # 证书与私钥是否配对
 _cert_key_match() {
-    local crt="${1:-$SSL_DIR/server.crt}" key="${2:-$SSL_DIR/server.key}" a b
+    local crt="$SSL_DIR/server.crt" key="$SSL_DIR/server.key" a b
     [[ -s "$crt" && -s "$key" ]] || return 1
     a=$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null)
     b=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl md5 2>/dev/null)
     [[ -n "$a" && "$a" == "$b" ]]
 }
 
-# 综合校验：存在 / 配对 / 未过期 /（可选）覆盖指定域名
+# 综合校验：存在 / 配对 / 未过期
 verify_cert() {
-    local expect="${1:-}" days
+    local days
     if [[ ! -s "$SSL_DIR/server.crt" || ! -s "$SSL_DIR/server.key" ]]; then
         _err "证书文件缺失: $SSL_DIR/server.crt"; return 1
     fi
@@ -1649,11 +1732,6 @@ verify_cert() {
     days=$(_cert_days_left)
     if [[ -n "$days" && "$days" -lt 0 ]]; then
         _err "证书已过期 ${days#-} 天"; return 1
-    fi
-    if [[ -n "$expect" ]] && ! _cert_covers "$expect"; then
-        _err "证书未覆盖域名 ${expect}"
-        echo -e "  ${D}证书包含: $(_cert_names | tr '\n' ' ')${NC}" >&2
-        return 1
     fi
     _ok "证书校验通过$( [[ -n "$days" ]] && echo "（剩余 ${days} 天）" )"
     return 0
@@ -1863,28 +1941,35 @@ install_acme_tool() {
     check_cmd curl || { _err "缺少 curl"; return 1; }
     check_cmd tar  || { _err "缺少 tar"; return 1; }
 
-    local tmp tarball url ok=false
+    local tag tmp tarball url ok=false
+    tag=$(_gh_latest_tag "acmesh-official/acme.sh")
+    [[ -n "$tag" && "$tag" =~ ^[0-9A-Za-z._-]+$ ]] || {
+        _err "无法取得 acme.sh 的稳定版本号，已拒绝从 master 分支安装"
+        return 1
+    }
     tmp=$(mktemp -d) || return 1
     tarball="$tmp/acme.tar.gz"
     for url in \
-        "https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz" \
-        "https://gh-proxy.com/https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz" \
-        "https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/heads/master"; do
+        "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${tag}.tar.gz" \
+        "https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tags/${tag}"; do
         _info "拉取: ${url%%\?*}"
         if curl -fsSL --connect-timeout 12 --max-time 120 -o "$tarball" "$url" 2>/dev/null &&
-           [[ -s "$tarball" ]] && tar -tzf "$tarball" >/dev/null 2>&1; then
+           [[ -s "$tarball" ]] && _archive_safe "$tarball" tar.gz; then
             ok=true; break
         fi
         _warn "该地址不可用，尝试下一个"
     done
     if [[ "$ok" != "true" ]]; then
         rm -rf "$tmp"
-        _err "acme.sh 下载失败（GitHub 与镜像均不可达）"
-        echo -e "  ${D}可手动执行: curl https://get.acme.sh | sh -s email=你的邮箱${NC}" >&2
+        _err "acme.sh v${tag} 下载失败（GitHub 不可达）"
         return 1
     fi
 
+    # GitHub 自动生成的源码包没有独立 SHA-256；执行其安装器前明确征得同意。
+    _confirm_unverified "acme.sh v${tag} 源码包" || { rm -rf "$tmp"; return 1; }
+
     tar -xzf "$tarball" -C "$tmp" || { rm -rf "$tmp"; _err "解包失败"; return 1; }
+    _tree_safe "$tmp" || { rm -rf "$tmp"; _err "acme.sh 压缩包含链接或特殊文件"; return 1; }
     local src; src=$(find "$tmp" -maxdepth 1 -type d -name 'acme.sh-*' | head -1)
     if [[ -z "$src" || ! -f "$src/acme.sh" ]]; then
         rm -rf "$tmp"; _err "压缩包结构异常，未找到 acme.sh"; return 1
@@ -1940,7 +2025,7 @@ setup_acme_email() {
     [[ -z "$cur" ]] && cur=$(_meta_get email)
     if [[ -n "$cur" ]]; then
         echo -e "  ${D}acme 账户邮箱: ${cur}${NC}" >&2
-        _ask_yes "是否更换邮箱?" || { ACME_EMAIL="$cur"; return 0; }
+        _ask_yes "是否更换邮箱?" || return 0
     fi
     while true; do
         if [[ -n "$ACME_DEFAULT_EMAIL" ]]; then
@@ -1952,7 +2037,6 @@ setup_acme_email() {
         if [[ "$email" == *@*.* ]]; then break; fi
         _err "邮箱格式无效，示例: you@example.com"
     done
-    ACME_EMAIL="$email"
     _meta_set email "$email"
     "$acme" --register-account -m "$email" --server "${SSL_CA:-letsencrypt}" >/dev/null 2>&1
     _ok "邮箱已设置: $email"
@@ -2012,8 +2096,8 @@ setup_dns_api() {
             export CF_Email CF_Key; unset CF_Token CF_Account_ID ;;
         3)
             DNS_PROVIDER="dns_ali"
-            read -rp "  Ali Key: " Ali_Key
-            read -rsp "  Ali Secret: " Ali_Secret; echo "" >&2
+            _read_secret Ali_Key "  Ali Key: "
+            _read_secret Ali_Secret "  Ali Secret: "
             [[ -z "$Ali_Key" || -z "$Ali_Secret" ]] && { _err "不能为空"; return 1; }
             export Ali_Key Ali_Secret ;;
         *)
@@ -2260,7 +2344,7 @@ _wildcard_of() {
 # 原样转发给它，让探测者看到那个网站的真实证书。因此它必须是别人的站点。
 # check_reality_dest <域名> [端口] -> 0 合适 / 1 不合适
 check_reality_dest() {
-    local d="$1" port="${2:-443}" v4 v6 my4 my6 out proto group vrc cd
+    local d="$1" port="${2:-443}" v4 v6 my4 my6 out proto group vrc
 
     # 1) 绝对不能是自己 —— 服务端要向该目标发起握手，指向自己会自握手/失败
     v4=$(_resolve_domain "$d" 4); v6=$(_resolve_domain "$d" 6)
@@ -2389,7 +2473,7 @@ _acme_conf_get() {
 
 # 从证书 issuer 判断 CA —— 比读 acme.sh conf 可靠，优先用它
 _ca_from_issuer() {
-    local crt="${1:-$SSL_DIR/server.crt}" issuer
+    local crt="$SSL_DIR/server.crt" issuer
     issuer=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null)
     [[ -z "$issuer" ]] && { echo "unknown"; return 1; }
     case "$issuer" in
@@ -2710,7 +2794,7 @@ install_cert_cron() {
     local acme; acme=$(_acme_bin) || return 0
     "$acme" --install-cronjob >/dev/null 2>&1
     check_cmd crontab || return 0
-    local script="/usr/local/bin/vless-server.sh"
+    local script="$SYSTEM_SCRIPT"
     [[ -x "$script" ]] || script=$(readlink -f "$0")
     local entry="10 4 * * * /bin/bash $script --cert-check >> $CFG/cert.log 2>&1 # vless-cert-check"
     # 先把现有内容读进变量，避免读写同一 spool 造成截断
@@ -2897,7 +2981,7 @@ _cert_import_files() {
 # REALITY 监听在别的端口，转发到它 —— 这样探测者看到的是你自己的真实网站，
 # 而不会因为指向 REALITY 自己的端口形成死循环。
 readonly SITE_PORT_FILE="$CFG/decoy_site_port"
-readonly SITE_ROOT="/var/www/decoy"
+readonly SITE_ROOT="${SONGBOX_SITE_ROOT:-/var/www/decoy}"
 readonly SITE_CONF_NAME="vless-decoy.conf"
 
 _nginx_conf_dir() {
@@ -2914,55 +2998,57 @@ decoy_site_running() {
     _port_listening "$port"
 }
 
-# v2ray-agent 提供的伪装站模板（9 套静态页面）
-readonly DECOY_TPL_BASE="https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable"
+# 项目仓库内置的原创静态模板，避免运行时依赖第三方模板仓库。
+readonly DECOY_TPL_BASE="${SONGBOX_ASSET_RAW_BASE:-https://raw.githubusercontent.com/NeverF1ower/songbox/main/assets/decoy-sites}"
+readonly LEGACY_DECOY_TPL_BASE="https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/assets/decoy-sites"
 declare -rA DECOY_TPL_NAME=(
-    [1]="新手引导" [2]="游戏站" [3]="个人博客 01" [4]="企业站 01"
-    [5]="音乐解锁工具" [6]="mikutap 互动页" [7]="企业站 02"
-    [8]="个人博客 02" [9]="404 跳转页"
+    [1]="服务状态页" [2]="产品文档页" [3]="个人作品页"
+)
+declare -rA DECOY_TPL_FILE=(
+    [1]="status.html" [2]="docs.html" [3]="portfolio.html"
 )
 
-# 下载并铺设 v2ray-agent 的伪装站模板
+# 从本仓库下载并铺设单文件静态模板
 # _install_decoy_template <编号|random>
 _install_decoy_template() {
-    local n="$1" url tmp z
-    [[ "$n" == "random" ]] && n=$(( ($(od -An -tu4 -N4 /dev/urandom 2>/dev/null | tr -d ' ') % 9) + 1 ))
-    [[ "$n" =~ ^[1-9]$ ]] || { _err "模板编号无效"; return 1; }
-    check_cmd unzip || {
-        _info "安装 unzip ..."
-        case "$DISTRO" in
-            alpine) apk add --no-cache unzip >/dev/null 2>&1 ;;
-            centos) yum install -y unzip >/dev/null 2>&1 ;;
-            *) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip >/dev/null 2>&1 ;;
-        esac
-        check_cmd unzip || { _err "缺少 unzip，无法解压模板"; return 1; }
-    }
+    local n="$1" url base tmp html filename size ok=false
+    [[ "$n" == "random" ]] && n=$(( ($(od -An -tu4 -N4 /dev/urandom 2>/dev/null | tr -d ' ') % 3) + 1 ))
+    [[ "$n" =~ ^[1-3]$ ]] || { _err "模板编号无效"; return 1; }
+    filename="${DECOY_TPL_FILE[$n]}"
     tmp=$(mktemp -d) || return 1
-    z="$tmp/html${n}.zip"
-    local ok=false
-    for url in "${DECOY_TPL_BASE}/html${n}.zip" "https://gh-proxy.com/${DECOY_TPL_BASE}/html${n}.zip"; do
+    html="$tmp/index.html"
+    for base in "$DECOY_TPL_BASE" "$LEGACY_DECOY_TPL_BASE"; do
+        while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
         _info "下载伪装站模板 ${n} (${DECOY_TPL_NAME[$n]}) ..."
-        if curl -fsSL --connect-timeout 12 --max-time 120 -o "$z" "$url" 2>/dev/null &&
-           [[ -s "$z" ]] && unzip -tq "$z" >/dev/null 2>&1; then
-            ok=true; break
-        fi
-        _warn "该地址不可用，尝试镜像"
+            if curl -fsSL --proto '=https' --connect-timeout 12 --max-time 60 \
+               -o "$html" "$url" 2>/dev/null; then
+                size=$(stat -c%s "$html" 2>/dev/null || echo 0)
+                if (( size >= 256 && size <= 524288 )) &&
+                   grep -qiE '<!doctype html|<html([[:space:]>])' "$html"; then
+                    ok=true; break 2
+                fi
+            fi
+            : >"$html"
+        done < <(_raw_mirrors "${base}/${filename}")
+        [[ "$base" == "$DECOY_TPL_BASE" ]] && {
+            _warn "新仓库资源地址不可用，尝试旧仓库兼容地址"
+        }
     done
-    [[ "$ok" != "true" ]] && { rm -rf "$tmp"; _err "模板下载失败"; return 1; }
+    if [[ "$ok" != "true" ]]; then
+        rm -rf "$tmp"
+        _err "模板下载或内容校验失败"
+        return 1
+    fi
 
     mkdir -p "$SITE_ROOT"
-    # 旧内容先清掉，避免不同模板的残留文件混在一起
     find "$SITE_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
-    unzip -o -q "$z" -d "$SITE_ROOT" || { rm -rf "$tmp"; _err "解压失败"; return 1; }
-    rm -rf "$tmp" "$SITE_ROOT/__MACOSX"
-    # 某些模板解压后多一层目录，把内容提上来
-    if [[ ! -f "$SITE_ROOT/index.html" ]]; then
-        local inner; inner=$(find "$SITE_ROOT" -mindepth 2 -maxdepth 2 -name index.html | head -1)
-        [[ -n "$inner" ]] && { mv "$(dirname "$inner")"/* "$SITE_ROOT"/ 2>/dev/null; }
-    fi
-    [[ -f "$SITE_ROOT/index.html" ]] || { _err "模板里没有 index.html"; return 1; }
-    chmod -R 755 "$SITE_ROOT"; find "$SITE_ROOT" -type f -exec chmod 644 {} + 2>/dev/null
-    echo "$n" >"$SITE_ROOT/.tpl"
+    install -m 644 "$html" "$SITE_ROOT/index.html" || {
+        rm -rf "$tmp"; _err "模板写入失败"; return 1
+    }
+    printf '%s\n' "$filename" >"$SITE_ROOT/.tpl"
+    chmod 644 "$SITE_ROOT/.tpl"
+    rm -rf "$tmp"
     _ok "伪装站模板已铺设: ${n} (${DECOY_TPL_NAME[$n]})"
 }
 
@@ -2973,8 +3059,8 @@ _choose_decoy_content() {
     echo -e "  ${W}伪装站页面${NC}" >&2
     echo -e "  ${D}探测者直连该端口时看到的就是这个网站，越像正常站点越好${NC}" >&2
     _line
-    _item "1" "v2ray-agent 模板 ${D}(9 套完整静态站，随机)${NC}"
-    _item "2" "v2ray-agent 模板 ${D}(手动指定编号)${NC}"
+    _item "1" "songbox 仓库模板 ${D}(3 套原创单页，随机)${NC}"
+    _item "2" "songbox 仓库模板 ${D}(手动指定编号)${NC}"
     _item "3" "内置极简页 ${D}(Service Status，体积最小)${NC}"
     _item "4" "保留现有内容 ${D}(${SITE_ROOT})${NC}"
     _line
@@ -2982,9 +3068,9 @@ _choose_decoy_content() {
     case "${c:-1}" in
         2)
             local i
-            for i in 1 2 3 4 5 6 7 8 9; do _item "$i" "${DECOY_TPL_NAME[$i]}"; done
-            local n; read -rp "  模板编号 [3]: " n
-            _install_decoy_template "${n:-3}" || _write_decoy_page ;;
+            for i in 1 2 3; do _item "$i" "${DECOY_TPL_NAME[$i]}"; done
+            local n; read -rp "  模板编号 [1]: " n
+            _install_decoy_template "${n:-1}" || _write_decoy_page ;;
         3) rm -f "$SITE_ROOT/.tpl"; find "$SITE_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
            _write_decoy_page ;;
         4) [[ -f "$SITE_ROOT/index.html" ]] || { _warn "现有内容为空，改用内置页"; _write_decoy_page; } ;;
@@ -3088,7 +3174,7 @@ setup_decoy_site() {
     local v6=""
     _has_ipv6 && v6="    listen [::]:${port} ssl;"
     cat >"$conf" <<EOF
-# REALITY 握手目标用的本机 HTTPS 站点（由 vless 脚本生成）
+# REALITY 握手目标用的本机 HTTPS 站点（由 songbox 生成）
 server {
     listen 127.0.0.1:${port} ssl;
     listen ${port} ssl;
@@ -3452,7 +3538,7 @@ detect_vps_capabilities() {
     [[ -n "$VPS_VIRT" && "$VPS_VIRT" != "none" ]] || VPS_VIRT=$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/^Hypervisor vendor:/{sub(/^[ \t]+/,"",$2); print $2; exit}')
     [[ -n "$VPS_VIRT" ]] || VPS_VIRT="未识别/裸机"
 
-    VPS_IPV4_ADDRS=""; VPS_IPV6_ADDRS=""; VPS_IPV4_IFACES=""; VPS_IPV6_IFACES=""
+    VPS_IPV4_ADDRS=""; VPS_IPV6_ADDRS=""; VPS_IPV6_IFACES=""
     VPS_IPV4_DEFAULT_IF=""; VPS_IPV6_DEFAULT_IF=""; VPS_HAS_IPV4=false; VPS_HAS_IPV6=false
     VPS_IPV4_DEFAULT=false; VPS_IPV6_DEFAULT=false
     if command -v ip >/dev/null 2>&1; then
@@ -3460,7 +3546,6 @@ detect_vps_capabilities() {
         ip6_lines=$(ip -6 -o addr show scope global 2>/dev/null | awk '$4 !~ /^fe80:/ && $0 !~ / tentative| dadfailed/ {print $2, $4}')
         VPS_IPV4_ADDRS=$(echo "$ip4_lines" | awk 'NF{print $2}' | paste -sd, -)
         VPS_IPV6_ADDRS=$(echo "$ip6_lines" | awk 'NF{print $2}' | paste -sd, -)
-        VPS_IPV4_IFACES=$(echo "$ip4_lines" | awk 'NF{print $1}' | sort -u | paste -sd' ' -)
         VPS_IPV6_IFACES=$(echo "$ip6_lines" | awk 'NF{print $1}' | sort -u | paste -sd' ' -)
         VPS_IPV4_DEFAULT_IF=$(ip -4 route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
         VPS_IPV6_DEFAULT_IF=$(ip -6 route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -3571,7 +3656,7 @@ _build_recommended_sysctl() {
         [[ -f /proc/sys/net/netfilter/nf_conntrack_udp_timeout ]] && REC_SYSCTL[net.netfilter.nf_conntrack_udp_timeout]="30"
         [[ -f /proc/sys/net/netfilter/nf_conntrack_udp_timeout_stream ]] && REC_SYSCTL[net.netfilter.nf_conntrack_udp_timeout_stream]="120"
     fi
-    RECO_CORES="$cores"; RECO_MEM="$mem"; RECO_CTMAX="$ctmax"
+    RECO_MEM="$mem"; RECO_CTMAX="$ctmax"
 }
 
 # net.ipv4.ip_forward 从 0 切到 1 时内核会重置一批 IPv4 参数，必须最先应用
@@ -3711,7 +3796,8 @@ apply_tuning_full() {
     _ask_yes "确认覆盖?" || return 0
     _ensure_bbr_ready || return 1
     _build_recommended_sysctl
-    local bk="/root/sysctl-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
+    local bk
+    bk="/root/sysctl-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
     tar -czf "$bk" /etc/sysctl.conf /etc/sysctl.d 2>/dev/null && \
         _ok "原有 sysctl 配置已备份: ${bk}"
     {
@@ -4240,7 +4326,7 @@ gen_sb_chain_outbound() {
     port=$(echo "$node" | jq -r '.port')
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
 
-    local sni insecure tls_json=""
+    local sni insecure
     sni=$(echo "$node" | jq -r '.sni // empty')
     insecure=$(echo "$node" | jq -r '.insecure // "false"')
     [[ -z "$sni" ]] && sni="$server"
@@ -4531,7 +4617,7 @@ generate_singbox_config() {
     #── 出站 ─────────────────────────────────────────────────────────────────────
     outbounds=$(jq -nc --argjson a "$outbounds" --argjson d "$(_sb_direct_outbound direct as_is)" '[$d] + $a')
 
-    local needed seen_direct="direct" ob
+    local needed ob
     needed=$(_collect_needed_outbounds | sed '/^$/d' | sort -u)
 
     # 直连派生出站（按 IP 版本）
@@ -4789,12 +4875,12 @@ declare -A SNELL_CONF=(
 )
 
 _write_openrc() {  # name desc cmd args [env] [retry] [start_pre_cmd]
-    local name="$1" desc="$2" cmd="$3" args="$4" env="$5" retry="${6:-0}" pre="${7:-}"
+    local name="$1" desc="$2" cmd="$3" service_args="$4" env="$5" retry="${6:-0}" pre="${7:-}"
     cat >"/etc/init.d/${name}" <<EOF
 #!/sbin/openrc-run
 name="${desc}"
 command="${cmd}"
-command_args="${args}"
+command_args="${service_args}"
 command_background="yes"
 pidfile="/run/${name}.pid"
 ${env:+export ${env}}
@@ -4895,7 +4981,8 @@ create_shadowtls_service() {  # snell-shadowtls / snell-v5-shadowtls
     stls_pw=$(db_field snell "$proto" stls_password)
     bport=$(db_field snell "$proto" backend_port)
     listen=$(_listen_addr)
-    local exec="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$listen" "$port") \
+    local shadow_exec
+    shadow_exec="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$listen" "$port") \
 --server 127.0.0.1:${bport} --tls ${sni}:443 --password ${stls_pw}"
     # ShadowTLS 在高版本内核上需回退旧 IO 驱动，避免 CPU 100%
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -4903,7 +4990,7 @@ create_shadowtls_service() {  # snell-shadowtls / snell-v5-shadowtls
             "--v3 server --listen $(_fmt_hostport "$listen" "$port") --server 127.0.0.1:${bport} --tls ${sni}:443 --password ${stls_pw}" \
             "MONOIO_FORCE_LEGACY_DRIVER=1"
     else
-        _write_systemd "$svc" "ShadowTLS ($proto)" "$exec" "MONOIO_FORCE_LEGACY_DRIVER=1"
+        _write_systemd "$svc" "ShadowTLS ($proto)" "$shadow_exec" "MONOIO_FORCE_LEGACY_DRIVER=1"
     fi
     # 后端 Snell
     local bsvc="${svc}-backend" bbin="${SNELL_BIN[$proto]}" bconf="${SNELL_CONF[$proto]}"
@@ -5080,7 +5167,7 @@ start_services() {
 
     local sb_protos; sb_protos=$(get_singbox_protocols)
     if [[ -n "$sb_protos" ]]; then
-        check_cmd sing-box || install_singbox || failed+=("$SB_SVC")
+        [[ -x "$SB_BIN" ]] || install_singbox || failed+=("$SB_SVC")
         gen_hop_nat_script
         if generate_singbox_config; then
             create_singbox_service
@@ -5180,33 +5267,44 @@ reload_config() {
 #───────────────────────────────────────────────────────────────────────────────
 # 快捷命令
 #───────────────────────────────────────────────────────────────────────────────
+_install_script_links() {  # _install_script_links <canonical-script>
+    local target="$1" legacy_backup="${LEGACY_SYSTEM_SCRIPT}.pre-songbox.bak"
+    [[ -f "$target" ]] || return 1
+    if [[ -e "$LEGACY_SYSTEM_SCRIPT" && ! -L "$LEGACY_SYSTEM_SCRIPT" && \
+          "$LEGACY_SYSTEM_SCRIPT" != "$target" && ! -e "$legacy_backup" ]]; then
+        cp -a "$LEGACY_SYSTEM_SCRIPT" "$legacy_backup" 2>/dev/null || true
+    fi
+    ln -sfn "$target" "$LEGACY_SYSTEM_SCRIPT" 2>/dev/null || return 1
+    ln -sfn "$target" /usr/local/bin/vless 2>/dev/null || return 1
+    ln -sfn "$target" /usr/bin/vless 2>/dev/null || true
+    hash -r 2>/dev/null
+}
+
 create_shortcut() {
-    local sys="/usr/local/bin/vless-server.sh" src
+    local sys="$SYSTEM_SCRIPT" src
     src=$(readlink -f "$0" 2>/dev/null || echo "$0")
     if [[ -f "$src" && "$src" != "$sys" ]]; then
         install -m 755 "$src" "$sys" 2>/dev/null || { _warn "无法写入 $sys"; return 1; }
     fi
     [[ -f "$sys" ]] || { _warn "未找到脚本文件，跳过快捷命令创建"; return 1; }
     chmod 755 "$sys"
-    ln -sf "$sys" /usr/local/bin/vless 2>/dev/null
-    ln -sf "$sys" /usr/bin/vless 2>/dev/null
-    hash -r 2>/dev/null
-    _ok "快捷命令已创建: vless"
+    _install_script_links "$sys" || { _warn "快捷命令链接创建失败"; return 1; }
+    _ok "脚本已安装: $sys（快捷命令: vless；旧路径保持兼容）"
 }
 
 _auto_sync_system_script() {
-    local sys="/usr/local/bin/vless-server.sh" src cur sys_md5
+    local sys="$SYSTEM_SCRIPT" src cur sys_md5
     src=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    [[ -f "$src" && "$src" != "$sys" ]] || return 0
-    if [[ ! -f "$sys" ]]; then install -m 755 "$src" "$sys" 2>/dev/null; return 0; fi
-    cur=$(md5sum "$src" 2>/dev/null | cut -d' ' -f1)
-    sys_md5=$(md5sum "$sys" 2>/dev/null | cut -d' ' -f1)
-    [[ "$cur" == "$sys_md5" ]] && return 0
-    install -m 755 "$src" "$sys" 2>/dev/null && {
-        ln -sf "$sys" /usr/local/bin/vless 2>/dev/null
-        ln -sf "$sys" /usr/bin/vless 2>/dev/null
-        _ok "系统脚本已同步 (v$VERSION)"
-    }
+    [[ -f "$src" ]] || return 0
+    if [[ "$src" != "$sys" ]]; then
+        cur=$(_sha256_file "$src" 2>/dev/null)
+        sys_md5=$(_sha256_file "$sys" 2>/dev/null)
+        if [[ ! -f "$sys" || -z "$cur" || "$cur" != "$sys_md5" ]]; then
+            install -m 755 "$src" "$sys" 2>/dev/null || return 1
+            _ok "系统脚本已同步到 $sys (v$VERSION)"
+        fi
+    fi
+    _install_script_links "$sys" >/dev/null 2>&1 || true
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -5233,15 +5331,22 @@ download_wgcf() {
     local ver; ver=$(_gh_latest_tag "ViRb3/wgcf"); ver="${ver#v}"
     [[ -z "$ver" ]] && ver="2.2.29"
     _info "下载 wgcf v${ver}..."
-    local urls=(
-        "https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
-        "https://gh-proxy.com/https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
-    )
+    local asset="wgcf_${ver}_linux_${arch}" expect
+    expect=$(_gh_asset_sha256 "ViRb3/wgcf" "v${ver}" "$asset" 2>/dev/null)
+    local urls=("https://github.com/ViRb3/wgcf/releases/download/v${ver}/${asset}")
+    if [[ -n "$expect" || "${ALLOW_THIRD_PARTY_MIRRORS:-0}" == "1" ]]; then
+        urls+=("https://gh-proxy.com/https://github.com/ViRb3/wgcf/releases/download/v${ver}/${asset}")
+    fi
     local u tmp; tmp=$(mktemp) || return 1
     for u in "${urls[@]}"; do
         if curl -fsSL -A "Mozilla/5.0" --connect-timeout 15 --max-time 90 -o "$tmp" "$u"; then
             local size; size=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
             if [[ "$size" -gt 100000 ]]; then
+                if [[ -n "$expect" ]]; then
+                    _verify_sha256 "$tmp" "$expect" || { _warn "wgcf SHA-256 不匹配，拒绝该下载源"; : >"$tmp"; continue; }
+                else
+                    _confirm_unverified "wgcf v${ver}" || { rm -f "$tmp"; return 1; }
+                fi
                 install -m 755 "$tmp" /usr/local/bin/wgcf && rm -f "$tmp" && { _ok "wgcf 已安装"; return 0; }
             fi
         fi
@@ -5268,28 +5373,31 @@ _select_best_warp_ipv6_endpoint() {
 
 register_warp_wgcf() {
     download_wgcf || return 1
-    local tmp old; tmp=$(mktemp -d) || return 1; old="$PWD"
-    cd "$tmp" || { rm -rf "$tmp"; return 1; }
+    local tmp; tmp=$(mktemp -d) || return 1
     _info "注册 WARP 账户..."
-    if ! /usr/local/bin/wgcf register --accept-tos >/dev/null 2>&1 || [[ ! -f wgcf-account.toml ]]; then
-        cd "$old"; rm -rf "$tmp"; _err "WARP 账户注册失败"; return 1
+    if ! ( cd "$tmp" &&
+           /usr/local/bin/wgcf register --accept-tos >/dev/null 2>&1 &&
+           [[ -f wgcf-account.toml ]] &&
+           /usr/local/bin/wgcf generate >/dev/null 2>&1 &&
+           [[ -f wgcf-profile.conf ]] ); then
+        rm -rf "$tmp"; _err "WARP 注册或配置生成失败"; return 1
     fi
-    _info "生成 WireGuard 配置..."
-    if ! /usr/local/bin/wgcf generate >/dev/null 2>&1 || [[ ! -f wgcf-profile.conf ]]; then
-        cd "$old"; rm -rf "$tmp"; _err "配置生成失败"; return 1
-    fi
+    _info "WireGuard 配置已生成"
 
     local pk pub ep addrs v4="" v6="" a
-    pk=$(_normalize_b64 "$(grep PrivateKey wgcf-profile.conf | cut -d= -f2- | xargs)")
-    pub=$(_normalize_b64 "$(grep PublicKey wgcf-profile.conf | cut -d= -f2- | xargs)")
-    ep=$(grep Endpoint wgcf-profile.conf | cut -d= -f2- | xargs)
-    addrs=$(grep Address wgcf-profile.conf | cut -d= -f2- | tr -d ' ' | tr '\n' ',')
+    pk=$(_normalize_b64 "$(grep PrivateKey "$tmp/wgcf-profile.conf" | cut -d= -f2- | xargs)")
+    pub=$(_normalize_b64 "$(grep PublicKey "$tmp/wgcf-profile.conf" | cut -d= -f2- | xargs)")
+    ep=$(grep Endpoint "$tmp/wgcf-profile.conf" | cut -d= -f2- | xargs)
+    addrs=$(grep Address "$tmp/wgcf-profile.conf" | cut -d= -f2- | tr -d ' ' | tr '\n' ',')
     IFS=',' read -r -a _a <<<"$addrs"
     for a in "${_a[@]}"; do
         [[ -z "$a" ]] && continue
         if [[ "$a" == *:* ]]; then v6="$a"; else v4="$a"; fi
     done
-    cd "$old"; rm -rf "$tmp"
+    rm -rf "$tmp"
+
+    [[ -n "$pk" && -n "$pub" && -n "$ep" ]] || {
+        _err "wgcf 输出缺少私钥、公钥或端点"; return 1; }
 
     if [[ -z "$(get_ipv4)" ]]; then
         local p="${ep##*:}"; [[ "$p" =~ ^[0-9]+$ ]] || p=2408
@@ -5468,7 +5576,8 @@ build_share_link() {
             echo "vless://${secret}@${addr}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=${insec}#${name}" ;;
         vless-ws-notls)
             local host; host=$(echo "$cfg" | jq -r '.host // empty')
-            local l="vless://${secret}@${addr}:${port}?encryption=none&security=none&type=ws&path=$(urlencode "$path")"
+            local l
+            l="vless://${secret}@${addr}:${port}?encryption=none&security=none&type=ws&path=$(urlencode "$path")"
             [[ -n "$host" ]] && l="${l}&host=${host}"
             echo "${l}#${name}" ;;
         vmess-ws)
@@ -5856,6 +5965,15 @@ _ask() {  # _ask <提示> <变量名> [默认值] [必填=1]
     done
 }
 
+_ask_secret() {  # _ask_secret <提示> <变量名> [必填=1]
+    local prompt="$1" __var="$2" req="${3:-1}" val=""
+    while true; do
+        _read_secret val "  ${prompt}: "
+        if [[ -z "$val" && "$req" == "1" ]]; then _err "该项不能为空"; continue; fi
+        printf -v "$__var" '%s' "$val"; return 0
+    done
+}
+
 _ask_host_port() {  # 设置 NODE_SERVER / NODE_PORT
     NODE_SERVER=""; NODE_PORT=""
     echo -e "  ${D}地址可填 IPv4 / IPv6 / 域名；IPv6 不需要方括号${NC}" >&2
@@ -5918,7 +6036,7 @@ chain_add_manual() {
             _ask_host_port
             local user pass
             _ask "用户名（无认证直接回车）" user "" 0
-            if [[ -n "$user" ]]; then _ask "密码" pass; else pass=""; fi
+            if [[ -n "$user" ]]; then _ask_secret "密码" pass; else pass=""; fi
             _ask_node_name "socks-${NODE_SERVER##*.}-${NODE_PORT}"
             node=$(jq -nc --arg n "$NODE_NAME" --arg s "$NODE_SERVER" --argjson p "$NODE_PORT" \
                 --arg u "$user" --arg w "$pass" \
@@ -5927,7 +6045,7 @@ chain_add_manual() {
             _ask_host_port
             local user pass tls="false" sni
             _ask "用户名（无认证直接回车）" user "" 0
-            if [[ -n "$user" ]]; then _ask "密码" pass; else pass=""; fi
+            if [[ -n "$user" ]]; then _ask_secret "密码" pass; else pass=""; fi
             _ask_yes "是否为 HTTPS (TLS) 代理?" && tls="true"
             sni=""
             [[ "$tls" == "true" ]] && _ask "SNI（回车使用服务器地址）" sni "$NODE_SERVER" 0
@@ -5942,7 +6060,7 @@ chain_add_manual() {
             echo -e "  ${D}SS2022: 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm${NC}" >&2
             local method pass
             _ask "加密方式" method "aes-256-gcm"
-            _ask "密码 / PSK" pass
+            _ask_secret "密码 / PSK" pass
             _ask_node_name "ss-${NODE_SERVER##*.}-${NODE_PORT}"
             node=$(jq -nc --arg n "$NODE_NAME" --arg s "$NODE_SERVER" --argjson p "$NODE_PORT" \
                 --arg m "$method" --arg w "$pass" \
@@ -5950,7 +6068,7 @@ chain_add_manual() {
         4)
             _ask_host_port
             local uuid net="tcp" tls="false" sni path host insec="false"
-            _ask "UUID" uuid
+            _ask_secret "UUID" uuid
             _ask_yes "是否使用 WebSocket 传输?" && net="ws"
             _ask_yes "是否启用 TLS?" && tls="true"
             sni=""; path="/"; host=""
@@ -5965,7 +6083,7 @@ chain_add_manual() {
         5)
             _ask_host_port
             local uuid sec="none" sni pbk sid flow net="tcp" path host insec="false"
-            _ask "UUID" uuid
+            _ask_secret "UUID" uuid
             echo -e "  ${D}安全层: 1) REALITY  2) TLS  3) 无${NC}" >&2
             local sc; read -rp "  请选择 [1]: " sc; sc="${sc:-1}"
             case "$sc" in 1) sec="reality" ;; 2) sec="tls" ;; *) sec="none" ;; esac
@@ -5991,7 +6109,7 @@ chain_add_manual() {
         6)
             _ask_host_port
             local pass sni net="tcp" path insec="false"
-            _ask "密码" pass
+            _ask_secret "密码" pass
             _ask "SNI" sni "$NODE_SERVER"
             _ask_yes "跳过证书校验?" && insec="true"
             path="/"
@@ -6005,8 +6123,8 @@ chain_add_manual() {
             _ask_host_port
             local pass sni insec="false" uuid
             case "$t" in
-                7|9) _ask "密码" pass ;;
-                8) _ask "UUID" uuid; _ask "密码" pass ;;
+                7|9) _ask_secret "密码" pass ;;
+                8) _ask_secret "UUID" uuid; _ask_secret "密码" pass ;;
             esac
             _ask "SNI" sni "$NODE_SERVER"
             _ask_yes "跳过证书校验?" && insec="true"
@@ -6187,7 +6305,7 @@ chain_add_link() {
     _line
     echo -e "  ${D}支持: ss:// vmess:// vless:// trojan:// hysteria2:// tuic:// anytls:// socks5://${NC}" >&2
     echo "" >&2
-    local link; read -rp "  分享链接: " link
+    local link; _read_secret link "  分享链接: "
     [[ -z "$link" ]] && return 0
     local node; node=$(parse_share_link "$link") || { _err "链接解析失败，请检查格式"; return 1; }
     local orig; orig=$(echo "$node" | jq -r '.name')
@@ -6206,7 +6324,7 @@ chain_import_subscription() {
     _header
     echo -e "  ${W}导入订阅${NC}" >&2
     _line
-    local url; read -rp "  订阅链接 (HTTPS): " url
+    local url; _read_secret url "  订阅链接 (HTTPS): "
     [[ -z "$url" ]] && return 0
     _is_valid_subscription_url "$url" || { _err "仅允许 HTTPS 订阅（如确需 HTTP 请设置 ALLOW_INSECURE_HTTP_SUBSCRIPTIONS=1）"; return 1; }
     _info "获取订阅内容..."
@@ -6256,7 +6374,7 @@ check_node_latency() {  # node_name -> "延迟ms|解析IP" 或 "超时|IP"
     local name="$1" node
     node=$(db_chain_node "$name") || { echo "超时|-"; return; }
     [[ -z "$node" ]] && { echo "超时|-"; return; }
-    check_cmd sing-box || { echo "N/A|-"; return; }
+    [[ -x "$SB_BIN" ]] || { echo "N/A|-"; return; }
 
     local server ip
     server=$(echo "$node" | jq -r '.server')
@@ -6713,11 +6831,11 @@ routing_add_rule() {
     # 多选时共用同一个出口与 IP 版本
     echo "" >&2
     if [[ "$total" -gt 1 ]]; then
-        local names="" k
-        for k in "${rtypes[@]}"; do names+="${ROUTING_PRESET_NAMES[$k]}, "; done
-        [[ "$want_custom" == "true" ]] && names+="自定义, "
-        [[ "$want_all" == "true" ]] && names+="所有流量, "
-        echo -e "  ${W}已选 ${total} 条规则:${NC} ${C}${names%, }${NC}" >&2
+        local selected_names="" k
+        for k in "${rtypes[@]}"; do selected_names+="${ROUTING_PRESET_NAMES[$k]}, "; done
+        [[ "$want_custom" == "true" ]] && selected_names+="自定义, "
+        [[ "$want_all" == "true" ]] && selected_names+="所有流量, "
+        echo -e "  ${W}已选 ${total} 条规则:${NC} ${C}${selected_names%, }${NC}" >&2
         echo -e "  ${D}它们将共用同一个出口与 IP 版本设置${NC}" >&2
     fi
     local ob; ob=$(_select_outbound "选择这些规则的出口" "true") || { _info "已取消"; return 0; }
@@ -7420,9 +7538,8 @@ show_cert_status() {
         _line
         return 1
     fi
-    local domain subj issuer nb na days sans
+    local domain issuer nb na days sans
     domain=$([[ -f "$CFG/cert_domain" ]] && cat "$CFG/cert_domain")
-    subj=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null | sed 's/^subject= *//')
     issuer=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null | sed -n 's/.*CN *= *\([^,/]*\).*/\1/p')
     nb=$(openssl x509 -in "$crt" -noout -startdate 2>/dev/null | cut -d= -f2)
     na=$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2)
@@ -7949,7 +8066,7 @@ _recommend_port() {
     case "$proto" in
         vless-vision|vless-ws|vmess-ws|trojan|trojan-ws|naive|anytls|ss2022-shadowtls|snell-shadowtls|snell-v5-shadowtls)
             for p in 443 8443 2096; do
-                ss -tuln 2>/dev/null | grep -qE ":$p[^0-9]" && continue
+                ss -tuln 2>/dev/null | grep -qE ":${p}[^0-9]" && continue
                 is_internal_port_occupied "$p" >/dev/null && continue
                 echo "$p"; return
             done
@@ -7990,7 +8107,7 @@ _ask_port() {  # _ask_port <proto> [replace_port]
         if grep -qx "$port" <<<"$own_ports" && [[ "$port" != "$replace" ]]; then
             _err "$(get_protocol_name "$proto") 已在端口 $port 上运行"; continue
         fi
-        if ss -tuln 2>/dev/null | grep -qE ":$port[^0-9]"; then
+        if ss -tuln 2>/dev/null | grep -qE ":${port}[^0-9]"; then
             if [[ -n "$replace" && "$port" == "$replace" ]]; then echo "$port"; return 0; fi
             _warn "端口 $port 已被系统进程占用"
             _ask_yes "强制使用?" && { echo "$port"; return 0; }
@@ -8008,13 +8125,12 @@ _ask_port() {  # _ask_port <proto> [replace_port]
     done
 }
 
-_ask_sni() {  # _ask_sni [cert_domain]
-    local cert_domain="${1:-}" def; def=$(gen_sni)
-    if [[ -n "$cert_domain" ]]; then echo "$cert_domain"; return 0; fi
+_ask_sni() {
+    local def; def=$(gen_sni)
     echo "" >&2
     _line
     echo -e "  ${W}伪装域名 (SNI / 握手目标)${NC}" >&2
-    echo -e "  ${D}这是"借用"的第三方网站，与本机证书无关：未通过认证的握手会被${NC}" >&2
+    echo -e "  ${D}这是借用的第三方网站，与本机证书无关：未通过认证的握手会被${NC}" >&2
     echo -e "  ${D}原样转发给它，探测者看到的是那个网站的真实证书。${NC}" >&2
     echo -e "  ${R}不要填自己的域名${NC}${D}——会自握手失败，也会把代理和你的域名绑定${NC}" >&2
     _line
@@ -8132,7 +8248,6 @@ _handle_existing_protocol() {
 # 协议选择
 #═══════════════════════════════════════════════════════════════════════════════
 select_protocol() {
-    SELECTED_PROTOCOL=""
     echo "" >&2
     _line
     echo -e "  ${W}选择代理协议${NC} ${D}(Sing-box 统一内核)${NC}" >&2
@@ -8235,8 +8350,6 @@ select_protocol() {
         _line
         _ask_yes "确认?" || return 1
     fi
-    # 兼容单选调用方
-    SELECTED_PROTOCOL="${SELECTED_PROTOCOLS[0]}"
     return 0
 }
 
@@ -8484,7 +8597,7 @@ _install_one_protocol() {
             if [[ "$version" == "6" ]]; then
                 echo -e "  ${D}Snell v6 PSK 需 16-255 位字母数字${NC}" >&2
                 while true; do
-                    read -rp "  PSK (回车随机生成): " psk
+                    _read_secret psk "  PSK (回车随机生成): "
                     [[ -z "$psk" ]] && psk=$(gen_password 32)
                     [[ ${#psk} -ge 16 && ${#psk} -le 255 && "$psk" =~ ^[0-9A-Za-z]+$ ]] && break
                     _err "PSK 只能包含数字与字母，长度 16-255"
@@ -8872,7 +8985,7 @@ _show_user_links() {
 install_expire_cron() {
     check_cmd crontab || { _warn "crontab 不可用，无法安装到期检查任务"; return 1; }
     crontab -l 2>/dev/null | grep -q "vless-check-expire" && return 0
-    local script="/usr/local/bin/vless-server.sh"
+    local script="$SYSTEM_SCRIPT"
     [[ -x "$script" ]] || script=$(readlink -f "$0")
     local entry="0 3 * * * /bin/bash $script --check-expire >> $CFG/expire.log 2>&1 # vless-check-expire"
     local cur; cur=$(crontab -l 2>/dev/null | grep -v "vless-check-expire")
@@ -9308,7 +9421,7 @@ setup_subscription() {
         read -rp "  订阅端口 [${def}]: " port; port="${port:-$def}"
         _is_valid_port "$port" || { _err "端口无效"; continue; }
         local owner; owner=$(is_internal_port_occupied "$port") && { _err "端口被 [$owner] 占用"; continue; }
-        if ss -tuln 2>/dev/null | grep -qE ":$port[^0-9]"; then
+        if ss -tuln 2>/dev/null | grep -qE ":${port}[^0-9]"; then
             _ask_yes "端口 $port 已被系统占用，强制使用?" || continue
         fi
         break
@@ -9504,7 +9617,7 @@ manage_protocol_services() {
                 fi
                 _pause ;;
             6)
-                local bp; read -rp "  输出路径 [回车用默认 /root/vless-backup-*.tar.gz]: " bp
+                local bp; read -rp "  输出路径 [回车用默认 /root/songbox-backup-*.tar.gz]: " bp
                 do_backup "$bp"; _pause ;;
             7) do_restore ""; _pause ;;
             8) manage_handshake_sni; _pause ;;
@@ -9624,7 +9737,7 @@ update_core_menu() {
         _header
         echo -e "  ${W}内核版本管理${NC}" >&2
         _line
-        local sbv latest
+        local sbv
         sbv=$(_sb_version); [[ -z "$sbv" ]] && sbv="未安装"
         echo -e "  ${W}Sing-box${NC}      当前: ${G}${sbv}${NC}" >&2
         echo -e "  ${W}Snell v4${NC}      当前: ${G}$(check_cmd snell-server && snell-server --v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 未安装)${NC}   推荐: ${C}${SNELL_V4_VERSION}${NC}" >&2
@@ -9677,6 +9790,7 @@ _raw_mirrors() {
     local u="$1"
     echo "$u"
     [[ "$u" != https://raw.githubusercontent.com/* ]] && return 0
+    [[ "${ALLOW_THIRD_PARTY_MIRRORS:-0}" == "1" ]] || return 0
 
     # gh-proxy 直接前缀即可
     echo "https://gh-proxy.com/${u}"
@@ -9690,6 +9804,14 @@ _raw_mirrors() {
     branch="${rest%%/*}"; path="${rest#*/}"
     if [[ -n "$owner" && -n "$repo" && -n "$branch" && -n "$path" && "$path" != "$branch" ]]; then
         echo "https://cdn.jsdelivr.net/gh/${owner}/${repo}@${branch}/${path}"
+    fi
+}
+
+_script_source_urls() {
+    _raw_mirrors "$SCRIPT_RAW_URL"
+    if [[ -z "${SONGBOX_SCRIPT_RAW_URL:-}" && -z "${VLESS_SCRIPT_RAW_URL:-}" && \
+          "$SCRIPT_RAW_URL" != "$LEGACY_SCRIPT_RAW_URL" ]]; then
+        _raw_mirrors "$LEGACY_SCRIPT_RAW_URL"
     fi
 }
 
@@ -9719,7 +9841,6 @@ do_update() {
     echo -e "  当前版本: ${G}v${VERSION}${NC}" >&2
     [[ -n "$REPO_URL" ]] && echo -e "  仓库    : ${D}${REPO_URL}${NC}" >&2
     echo -e "  构建    : ${Y}${CUSTOM_BUILD}${NC}" >&2
-    _warn "在线更新会覆盖本构建的 Alpine sysctl 兼容与 Realm 菜单，请先备份当前脚本"
 
     if [[ -z "$SCRIPT_RAW_URL" ]]; then
         _line
@@ -9740,28 +9861,41 @@ do_update() {
     }
     _line
 
-    local tmp url got=false
+    local tmp url fetched_url="" got=false
     tmp=$(mktemp) || return 1
     while IFS= read -r url; do
         [[ -z "$url" ]] && continue
         _info "拉取: ${url}"
         if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$url" 2>/dev/null &&
            [[ -s "$tmp" ]] && head -1 "$tmp" | grep -q '^#!.*bash'; then
-            got=true; break
+            got=true; fetched_url="$url"; break
         fi
         _warn "该地址不可用，尝试下一个"
-    done < <(_raw_mirrors "$SCRIPT_RAW_URL")
+    done < <(_script_source_urls)
 
     if [[ "$got" != "true" ]]; then
         rm -f "$tmp"
-        _err "下载失败：GitHub 与镜像均不可达"
-        echo -e "  ${D}可稍后重试，或手动: wget -O /usr/local/bin/vless-server.sh '<raw地址>'${NC}" >&2
+        _err "下载失败：新旧 GitHub 仓库地址均不可达"
+        [[ "${ALLOW_THIRD_PARTY_MIRRORS:-0}" != "1" ]] &&
+            echo -e "  ${D}如确认镜像可信，可设置 ALLOW_THIRD_PARTY_MIRRORS=1 后重试${NC}" >&2
+        echo -e "  ${D}可稍后重试，或手动下载到 $SYSTEM_SCRIPT${NC}" >&2
         return 1
     fi
 
     # 语法校验 + 版本提取，避免把坏脚本写进系统
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"; _err "下载的脚本语法校验失败，已放弃更新"; return 1
+    fi
+    if ! grep -qx 'readonly AUTHOR="NeverF1ower"' "$tmp" ||
+       ! grep -qE '^readonly SCRIPT_NAME="(songbox|SingBox 万能工具箱)"$' "$tmp"; then
+        rm -f "$tmp"; _err "下载文件的作者或脚本标识不匹配，已拒绝更新"; return 1
+    fi
+    local expected_script_sha="${SONGBOX_SCRIPT_SHA256:-${VLESS_SCRIPT_SHA256:-}}"
+    if [[ -n "$expected_script_sha" ]] && ! _verify_sha256 "$tmp" "$expected_script_sha"; then
+        rm -f "$tmp"; _err "下载脚本与 SONGBOX_SCRIPT_SHA256 / VLESS_SCRIPT_SHA256 不匹配"; return 1
+    fi
+    if [[ "$fetched_url" != "$SCRIPT_RAW_URL" ]]; then
+        _warn "使用了兼容或镜像地址；未提供脚本 SHA-256 时请确认来源"
     fi
     local remote; remote=$(grep -m1 '^readonly VERSION=' "$tmp" | cut -d'"' -f2)
     if [[ -z "$remote" ]]; then
@@ -9777,20 +9911,28 @@ do_update() {
         fi
         _warn "版本号相同但文件内容有差异（作者可能未提版本号）"
         _ask_yes "仍要覆盖为远程版本?" || { rm -f "$tmp"; return 0; }
+    elif _version_ge "$VERSION" "$remote" && [[ "${ALLOW_SCRIPT_DOWNGRADE:-0}" != "1" ]]; then
+        rm -f "$tmp"
+        _err "远程版本 v${remote} 旧于当前 v${VERSION}，已阻止降级"
+        echo -e "  ${D}确需降级时可设置 ALLOW_SCRIPT_DOWNGRADE=1${NC}" >&2
+        return 1
     else
         _ask_yes "更新到 v${remote}?" || { rm -f "$tmp"; return 0; }
     fi
 
     local self; self=$(readlink -f "$0")
     cp "$self" "${self}.bak" 2>/dev/null
-    if install -m 755 "$tmp" "$self"; then
+    if install -m 755 "$tmp" "$SYSTEM_SCRIPT"; then
+        if [[ "$self" != "$SYSTEM_SCRIPT" && "$self" != "$LEGACY_SYSTEM_SCRIPT" ]]; then
+            install -m 755 "$tmp" "$self" 2>/dev/null || _warn "当前启动文件未覆盖，但系统脚本已更新"
+        fi
+        _install_script_links "$SYSTEM_SCRIPT" || {
+            rm -f "$tmp"; _err "新脚本已写入，但兼容快捷链接创建失败"; return 1; }
         rm -f "$tmp"
-        [[ "$self" != "/usr/local/bin/vless-server.sh" ]] &&
-            install -m 755 "$self" /usr/local/bin/vless-server.sh 2>/dev/null
-        ln -sf /usr/local/bin/vless-server.sh /usr/local/bin/vless 2>/dev/null
         _dline
         _ok "更新完成: v${VERSION} → v${remote}"
-        echo -e "  ${C}请重新执行 vless 进入新版本${NC}   ${D}(旧版备份: ${self}.bak)${NC}" >&2
+        echo -e "  ${C}请重新执行 vless 进入新版本${NC}" >&2
+        echo -e "  ${D}规范路径: $SYSTEM_SCRIPT；旧路径与 vless 快捷命令继续有效；旧版备份: ${self}.bak${NC}" >&2
         _dline
         exit 0
     fi
@@ -10192,7 +10334,7 @@ realm_modify_rule() {
         break
     done < <(_realm_rules_tsv)
     [[ -n "$old_port" && -n "$old_host" ]] || {
-        _err "无法解析该规则，请使用“手动编辑 config.toml”"; return 1; }
+        _err "无法解析该规则，请使用「手动编辑 config.toml」"; return 1; }
 
     local local_port remote_host remote_port new_remark
     while true; do
@@ -10223,7 +10365,8 @@ realm_modify_rule() {
     new_remark="${new_remark:-$remark}"
     new_remark=$(_realm_safe_remark "$new_remark")
 
-    local backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')" tmp
+    local backup tmp
+    backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')"
     cp -a "$REALM_CONF" "$backup"
     tmp=$(mktemp "$REALM_DIR/config.XXXXXX") || return 1
     local new_listen new_remote
@@ -10287,7 +10430,8 @@ realm_delete_rule() {
         pick="all"; label="全部规则"
     fi
     _ask_yes "确认删除$label?" || return 0
-    local backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')"
+    local backup
+    backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')"
     cp -a "$REALM_CONF" "$backup"
     _realm_delete_endpoint "$pick" || { _err "删除失败"; return 1; }
     _ok "已删除（旧配置: $backup）"
@@ -10311,7 +10455,8 @@ realm_edit_config() {
     fi
     [[ -n "$editor" ]] || {
         _err "未找到文本编辑器，请安装 nano/vi，或设置 EDITOR"; return 1; }
-    local backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')"
+    local backup
+    backup="$REALM_CONF.bak.$(date '+%Y%m%d-%H%M%S')"
     cp -a "$REALM_CONF" "$backup"
     _info "使用 $editor 编辑 $REALM_CONF"
     "$editor" "$REALM_CONF"
@@ -10435,7 +10580,7 @@ _realm_set_cron() {
     create_shortcut >/dev/null 2>&1 || true
     local tmp; tmp=$(mktemp) || return 1
     crontab -l 2>/dev/null | grep -v '# vless-realm-restart$' >"$tmp" || true
-    echo "$expr /usr/local/bin/vless-server.sh --realm-restart >/dev/null 2>&1 # vless-realm-restart" >>"$tmp"
+    echo "$expr $SYSTEM_SCRIPT --realm-restart >/dev/null 2>&1 # vless-realm-restart" >>"$tmp"
     crontab "$tmp" || {
         rm -f "$tmp"; _err "写入 crontab 失败"; return 1; }
     rm -f "$tmp"
@@ -10556,7 +10701,7 @@ realm_menu() {
 }
 
 do_uninstall() {
-    check_installed || { _warn "未安装"; return; }
+    [[ -f "$DB_FILE" || -f "$REALM_CONF" ]] || { _warn "未安装"; return; }
     _header
     echo -e "  ${W}完全卸载${NC}" >&2
     _line
@@ -10598,13 +10743,13 @@ do_uninstall() {
         iptables -X "$TRAFFIC_CHAIN" 2>/dev/null
     }
 
-    crontab -l 2>/dev/null | grep -v "vless-check-expire" | crontab - 2>/dev/null
+    crontab -l 2>/dev/null | grep -vE "vless-check-expire|vless-cert-check|vless-realm-restart" | crontab - 2>/dev/null
 
     _info "删除配置文件（保留证书）..."
     rm -f "$CFG"/*.json "$CFG"/*.conf "$CFG"/*.sh "$CFG"/sub.info "$CFG"/sub_uuid "$CFG"/cache.db 2>/dev/null
     rm -rf "$CFG/subscription" "$RULESET_DIR" 2>/dev/null
 
-    rm -f /usr/local/bin/vless /usr/bin/vless /usr/local/bin/vless-server.sh 2>/dev/null
+    rm -f /usr/local/bin/vless /usr/bin/vless "$SYSTEM_SCRIPT" "$LEGACY_SYSTEM_SCRIPT" 2>/dev/null
 
     _ok "卸载完成"
     _line
@@ -10624,7 +10769,170 @@ do_uninstall() {
 # 备份包内部结构:
 #   etc/     -> $CFG 下需要保留的文件（db.json 是核心，含全部协议参数与用户）
 #   acme/    -> ~/.acme.sh 账户与证书状态（保证真实证书可继续自动续期）
+#   site/    -> 本机 HTTPS 伪装站内容（如果存在）
 #   meta.txt -> 版本 / 时间 / 主机信息
+#   manifest.sha256 -> 包内文件完整性清单
+
+_backup_state_files() {
+    printf '%s\n' db.json warp.json sub_uuid sub.info cert_domain cert_meta \
+        dns_api.conf decoy_site_port node_name no_firewall
+}
+
+_write_backup_manifest() {  # _write_backup_manifest <package-root>
+    local root="$1" file rel digest
+    : >"$root/manifest.sha256" || return 1
+    while IFS= read -r file; do
+        rel="${file#"$root"/}"
+        [[ "$rel" == "manifest.sha256" ]] && continue
+        [[ "$rel" == *$'\t'* || "$rel" == *$'\r'* || "$rel" == *$'\n'* ]] && {
+            _err "备份文件名包含不可移植字符: $rel"; return 1; }
+        digest=$(_sha256_file "$file")
+        [[ "$digest" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+        printf '%s\t%s\n' "${digest,,}" "$rel" >>"$root/manifest.sha256"
+    done < <(find "$root" -type f -print 2>/dev/null | LC_ALL=C sort)
+    [[ -s "$root/manifest.sha256" ]]
+}
+
+_verify_backup_manifest() {  # _verify_backup_manifest <package-root>
+    local root="$1" manifest="$1/manifest.sha256" expected rel file count=0 actual=0
+    local -A seen=()
+    [[ -f "$manifest" ]] || return 2
+    while IFS=$'\t' read -r expected rel; do
+        [[ "$expected" =~ ^[0-9a-fA-F]{64}$ && -n "$rel" ]] || return 1
+        case "$rel" in /*|../*|*/../*|*/..|..|*\\*|*$'\r'*|*$'\n'*) return 1 ;; esac
+        [[ -z "${seen[$rel]:-}" ]] || return 1
+        seen["$rel"]=1
+        [[ -f "$root/$rel" ]] || return 1
+        _verify_sha256 "$root/$rel" "$expected" || return 1
+        ((count++))
+    done <"$manifest"
+    (( count > 0 )) || return 1
+
+    # 清单不仅要校验已列出的文件，还必须覆盖包内全部普通文件。
+    # 否则攻击者可追加一个未登记的 acme.sh 脚本而不触发哈希失败。
+    while IFS= read -r file; do
+        rel="${file#"$root"/}"
+        [[ "$rel" == "manifest.sha256" ]] && continue
+        [[ -n "${seen[$rel]:-}" ]] || return 1
+        ((actual++))
+    done < <(find "$root" -type f -print 2>/dev/null | LC_ALL=C sort)
+    (( actual == count ))
+}
+
+RESTORE_PACKAGE_ROOT=""
+RESTORE_CFG_SOURCE=""
+_detect_restore_payload() {  # _detect_restore_payload <extracted-root>
+    local root="$1" db rel first rest package cfg count=0
+    RESTORE_PACKAGE_ROOT=""; RESTORE_CFG_SOURCE=""
+    while IFS= read -r -d '' db; do
+        rel="${db#"$root"/}"
+        package="$root"; cfg=""
+        case "$rel" in
+            db.json) cfg="$root" ;;
+            etc/db.json) cfg="$root/etc" ;;
+            vless-reality/db.json) cfg="$root/vless-reality" ;;
+            etc/vless-reality/db.json) cfg="$root/etc/vless-reality" ;;
+            *)
+                [[ "$rel" == */* ]] || continue
+                first="${rel%%/*}"; rest="${rel#*/}"; package="$root/$first"
+                case "$rest" in
+                    db.json) cfg="$package" ;;
+                    etc/db.json) cfg="$package/etc" ;;
+                    vless-reality/db.json) cfg="$package/vless-reality" ;;
+                    etc/vless-reality/db.json) cfg="$package/etc/vless-reality" ;;
+                    *) continue ;;
+                esac
+                ;;
+        esac
+        ((count++))
+        RESTORE_PACKAGE_ROOT="$package"
+        RESTORE_CFG_SOURCE="$cfg"
+    done < <(find "$root" -maxdepth 5 -type f -name db.json -print0 2>/dev/null)
+    (( count == 1 ))
+}
+
+_prepare_restore_package() {  # _prepare_restore_package <archive> <work-dir>
+    local src="$1" raw="$2/raw" pkg="$2/pkg"
+    local max_bytes="${SONGBOX_MAX_BACKUP_BYTES:-${VLESS_MAX_BACKUP_BYTES:-536870912}}"
+    local entry_count expanded_kb archive_bytes f acme_src="" site_src="" candidate manifest_rc
+    [[ "$max_bytes" =~ ^[0-9]+$ ]] || { _err "SONGBOX_MAX_BACKUP_BYTES 必须是整数"; return 1; }
+    archive_bytes=$(stat -c%s "$src" 2>/dev/null || stat -f%z "$src" 2>/dev/null || echo 0)
+    (( archive_bytes > 0 && archive_bytes <= max_bytes )) || { _err "备份大小异常或超过上限"; return 1; }
+    _archive_safe "$src" tar.gz || { _err "备份包路径或文件类型不安全"; return 1; }
+    entry_count=$(tar -tf "$src" 2>/dev/null | wc -l)
+    (( entry_count > 0 && entry_count <= 20000 )) || { _err "备份条目数量异常"; return 1; }
+
+    mkdir -p "$raw" "$pkg/etc" || return 1
+    ( ulimit -f $((max_bytes / 512)); tar -xf "$src" -C "$raw" 2>/dev/null ) || {
+        _err "解包失败或单个文件超过大小上限"; return 1; }
+    _tree_safe "$raw" || { _err "备份解包后包含链接、特殊文件或危险权限"; return 1; }
+    expanded_kb=$(du -sk "$raw" 2>/dev/null | awk '{print $1}')
+    (( ${expanded_kb:-0} <= max_bytes / 1024 )) || { _err "备份解包后超过允许大小"; return 1; }
+
+    _detect_restore_payload "$raw" || {
+        _err "无法唯一识别备份中的 db.json（支持 etc/db.json、etc/vless-reality/db.json 和旧版目录包）"
+        return 1
+    }
+    if [[ -f "$RESTORE_PACKAGE_ROOT/manifest.sha256" ]]; then
+        _verify_backup_manifest "$RESTORE_PACKAGE_ROOT"; manifest_rc=$?
+        (( manifest_rc == 0 )) || { _err "备份内部完整性校验失败"; return 1; }
+        cp -a "$RESTORE_PACKAGE_ROOT/manifest.sha256" "$pkg/"
+    else
+        _warn "旧版备份不含内部完整性清单，将按兼容模式恢复"
+    fi
+
+    while IFS= read -r f; do
+        [[ -e "$RESTORE_CFG_SOURCE/$f" ]] && cp -a "$RESTORE_CFG_SOURCE/$f" "$pkg/etc/"
+    done < <(_backup_state_files)
+    [[ -d "$RESTORE_CFG_SOURCE/certs" ]] && cp -a "$RESTORE_CFG_SOURCE/certs" "$pkg/etc/"
+    if [[ -s "$RESTORE_CFG_SOURCE/realm/config.toml" ]]; then
+        mkdir -p "$pkg/etc/realm"
+        cp -a "$RESTORE_CFG_SOURCE/realm/config.toml" "$pkg/etc/realm/"
+    fi
+    [[ -f "$pkg/etc/db.json" ]] || { _err "备份中缺少可恢复的 db.json"; return 1; }
+
+    for candidate in \
+        "$RESTORE_PACKAGE_ROOT/acme" "$RESTORE_PACKAGE_ROOT/.acme.sh" \
+        "$RESTORE_PACKAGE_ROOT/root/.acme.sh" "$raw/acme" "$raw/.acme.sh" "$raw/root/.acme.sh"; do
+        [[ -d "$candidate" ]] || continue
+        acme_src="$candidate"; break
+    done
+    [[ -n "$acme_src" ]] && { mkdir -p "$pkg/acme"; cp -a "$acme_src/." "$pkg/acme/"; }
+
+    for candidate in \
+        "$RESTORE_PACKAGE_ROOT/site" "$RESTORE_PACKAGE_ROOT/var/www/decoy" \
+        "$raw/site" "$raw/var/www/decoy"; do
+        [[ -d "$candidate" ]] || continue
+        site_src="$candidate"; break
+    done
+    [[ -n "$site_src" ]] && { mkdir -p "$pkg/site"; cp -a "$site_src/." "$pkg/site/"; }
+
+    if [[ -f "$RESTORE_PACKAGE_ROOT/meta.txt" ]]; then
+        cp -a "$RESTORE_PACKAGE_ROOT/meta.txt" "$pkg/"
+    elif [[ -f "$raw/meta.txt" ]]; then
+        cp -a "$raw/meta.txt" "$pkg/"
+    else
+        printf 'backup_format=legacy\nsource_layout=%s\n' \
+            "${RESTORE_CFG_SOURCE#"$raw"/}" >"$pkg/meta.txt"
+    fi
+    _tree_safe "$pkg" || { _err "规范化后的备份内容不安全"; return 1; }
+}
+
+_rollback_restore_switch() {  # stamp cfg_previous acme_previous site_previous acme_touched site_touched
+    local stamp="$1" cfg_previous="$2" acme_previous="$3" site_previous="$4"
+    local acme_touched="${5:-false}" site_touched="${6:-false}"
+    if [[ -d "$CFG" ]]; then mv "$CFG" "${CFG}.failed-restore-${stamp}" 2>/dev/null || true; fi
+    [[ -n "$cfg_previous" && -d "$cfg_previous" ]] && mv "$cfg_previous" "$CFG" 2>/dev/null
+    if [[ "$acme_touched" == "true" && -d "$HOME/.acme.sh" ]]; then
+        mv "$HOME/.acme.sh" "$HOME/.acme.sh.failed-restore-${stamp}" 2>/dev/null || true
+    fi
+    [[ -n "$acme_previous" && -d "$acme_previous" ]] && mv "$acme_previous" "$HOME/.acme.sh" 2>/dev/null
+    if [[ "$site_touched" == "true" && -d "$SITE_ROOT" ]]; then
+        mv "$SITE_ROOT" "${SITE_ROOT}.failed-restore-${stamp}" 2>/dev/null || true
+    fi
+    [[ -n "$site_previous" && -d "$site_previous" ]] && mv "$site_previous" "$SITE_ROOT" 2>/dev/null
+}
+
 do_backup() {
     local out="${1:-}"
     if [[ ! -f "$DB_FILE" ]]; then
@@ -10633,25 +10941,31 @@ do_backup() {
     [[ -f "$DB_FILE" ]] || {
         _err "未找到协议或 Realm 配置，没有可备份的内容"; return 1; }
     check_cmd tar || { _err "缺少 tar 命令"; return 1; }
+    check_cmd jq || { _err "缺少 jq，无法校验数据库"; return 1; }
+    jq -e 'type == "object"' "$DB_FILE" >/dev/null 2>&1 || {
+        _err "$DB_FILE 不是有效的 JSON 对象，已拒绝生成不可恢复的备份"; return 1; }
     if [[ -z "$out" ]]; then
-        out="/root/vless-backup-$(hostname -s 2>/dev/null || echo host)-$(date '+%Y%m%d-%H%M%S').tar.gz"
+        out="/root/songbox-backup-$(hostname -s 2>/dev/null || echo host)-$(date '+%Y%m%d-%H%M%S').tar.gz"
     fi
     mkdir -p "$(dirname "$out")" 2>/dev/null || { _err "无法创建目录: $(dirname "$out")"; return 1; }
 
-    local tmp; tmp=$(mktemp -d) || return 1
+    local tmp tmp_out validate_tmp f
+    tmp=$(mktemp -d) || return 1
     mkdir -p "$tmp/pkg/etc"
-    local f
-    for f in db.json warp.json sub_uuid sub.info cert_domain cert_meta dns_api.conf decoy_site_port; do
+    while IFS= read -r f; do
         [[ -e "$CFG/$f" ]] && cp -a "$CFG/$f" "$tmp/pkg/etc/"
-    done
+    done < <(_backup_state_files)
     if [[ -f "$REALM_CONF" ]]; then
         mkdir -p "$tmp/pkg/etc/realm"
         cp -a "$REALM_CONF" "$tmp/pkg/etc/realm/"
     fi
     [[ -d "$SSL_DIR" ]] && cp -a "$SSL_DIR" "$tmp/pkg/etc/"
     [[ -d "$HOME/.acme.sh" ]] && cp -a "$HOME/.acme.sh" "$tmp/pkg/acme"
+    [[ -d "$SITE_ROOT" ]] && { mkdir -p "$tmp/pkg/site"; cp -a "$SITE_ROOT/." "$tmp/pkg/site/"; }
 
     {
+        echo "project=songbox"
+        echo "backup_format=2"
         echo "script_version=$VERSION"
         echo "backup_time=$(date '+%F %T %z')"
         echo "hostname=$(hostname 2>/dev/null)"
@@ -10661,23 +10975,63 @@ do_backup() {
         echo "realm_rules=$(_realm_rule_count)"
     } >"$tmp/pkg/meta.txt"
 
-    if tar -czf "$out" -C "$tmp/pkg" . 2>/dev/null; then
-        chmod 600 "$out"
+    _tree_safe "$tmp/pkg" || { rm -rf "$tmp"; _err "备份源中包含链接、特殊文件或危险权限"; return 1; }
+    _write_backup_manifest "$tmp/pkg" || { rm -rf "$tmp"; _err "生成备份完整性清单失败"; return 1; }
+
+    tmp_out=$(mktemp "${out}.tmp.XXXXXX") || { rm -rf "$tmp"; return 1; }
+    if tar -czf "$tmp_out" -C "$tmp/pkg" . 2>/dev/null && _archive_safe "$tmp_out" tar.gz; then
+        # 发布前再走一次恢复解析器，确保本次产物确实可读取。
+        validate_tmp=$(mktemp -d) || { rm -rf "$tmp" "$tmp_out"; return 1; }
+        if ! _prepare_restore_package "$tmp_out" "$validate_tmp" ||
+           ! jq -e 'type == "object"' "$validate_tmp/pkg/etc/db.json" >/dev/null 2>&1; then
+            rm -rf "$tmp" "$tmp_out" "$validate_tmp"
+            _err "备份自检失败，未覆盖目标文件"
+            return 1
+        fi
+        rm -rf "$validate_tmp"
+        chmod 600 "$tmp_out"
+        mv -f "$tmp_out" "$out" || { rm -rf "$tmp" "$tmp_out"; _err "发布备份文件失败"; return 1; }
         rm -rf "$tmp"
         _dline
-        _ok "备份完成"
+        _ok "备份完成并通过恢复自检"
         echo -e "  文件: ${G}${out}${NC}" >&2
         echo -e "  大小: ${C}$(du -h "$out" | cut -f1)${NC}   SHA256: ${D}$(_sha256_file "$out")${NC}" >&2
         echo -e "  含  : ${C}$(db_all_protocols | tr '\n' ' ')${NC}" >&2
         [[ -f "$REALM_CONF" ]] &&
             echo -e "         ${C}Realm $(_realm_rule_count) 条转发规则${NC}" >&2
+        [[ -d "$SITE_ROOT" ]] && echo -e "         ${C}伪装站页面${NC}" >&2
         _dline
         echo -e "  ${Y}请立刻把它下载到本地（备份内含全部密钥，务必妥善保管）:${NC}" >&2
         echo -e "  ${C}scp root@$(get_ipv4 || echo YOUR_IP):${out} ./${NC}" >&2
         _line
         return 0
     fi
-    rm -rf "$tmp"; _err "打包失败"; return 1
+    rm -rf "$tmp" "$tmp_out"; _err "打包或归档校验失败"; return 1
+}
+
+do_list_backup() {  # do_list_backup <archive> [verify-only]
+    local src="$1" verify_only="${2:-false}" tmp
+    [[ -f "$src" ]] || { _err "文件不存在: $src"; return 1; }
+    check_cmd tar || { _err "缺少 tar 命令"; return 1; }
+    check_cmd jq || { _err "缺少 jq 命令"; return 1; }
+    tmp=$(mktemp -d) || return 1
+    if ! _prepare_restore_package "$src" "$tmp"; then rm -rf "$tmp"; return 1; fi
+    jq -e 'type == "object"' "$tmp/pkg/etc/db.json" >/dev/null 2>&1 || {
+        rm -rf "$tmp"; _err "备份中的 db.json 不是合法 JSON"; return 1; }
+    _ok "备份结构与完整性检查通过"
+    if [[ "$verify_only" != "true" ]]; then
+        sed 's/^/  /' "$tmp/pkg/meta.txt" 2>/dev/null
+        echo "--- 协议与端口 ---"
+        jq -r '
+            [((.singbox // {}) | to_entries[]), ((.snell // {}) | to_entries[])]
+            | sort_by(.key)[]
+            | "\(.key)\t端口 \([.value[].port] | join(","))\t用户 \([.value[].users // [] | length] | add // 0)"' \
+            "$tmp/pkg/etc/db.json"
+        [[ -s "$tmp/pkg/etc/realm/config.toml" ]] && echo "realm\t包含转发配置"
+        [[ -f "$tmp/pkg/site/index.html" ]] && echo "decoy-site\t包含伪装站页面"
+        [[ -d "$tmp/pkg/acme" ]] && echo "acme.sh\t包含账户与续期状态"
+    fi
+    rm -rf "$tmp"
 }
 
 # do_restore <备份文件> [只恢复的协议,逗号分隔|all]
@@ -10687,27 +11041,37 @@ do_restore() {
         read -rp "  备份文件路径: " src
     fi
     [[ -f "$src" ]] || { _err "文件不存在: $src"; return 1; }
-    check_cmd tar || { _err "缺少 tar 命令"; return 1; }
-    tar -tzf "$src" >/dev/null 2>&1 || { _err "不是有效的 tar.gz 备份"; return 1; }
+    check_dependencies false || { _err "恢复所需依赖安装失败"; return 1; }
+    local backup_size max_backup_size="${SONGBOX_MAX_BACKUP_BYTES:-${VLESS_MAX_BACKUP_BYTES:-536870912}}"
+    backup_size=$(stat -c%s "$src" 2>/dev/null || stat -f%z "$src" 2>/dev/null || echo 0)
+    [[ "$max_backup_size" =~ ^[0-9]+$ ]] || { _err "SONGBOX_MAX_BACKUP_BYTES 必须是整数"; return 1; }
+    (( backup_size > 0 && backup_size <= max_backup_size )) || {
+        _err "备份大小异常或超过上限 (${max_backup_size} bytes)"; return 1; }
+    local restore_sha; restore_sha=$(_sha256_file "$src")
+    _info "备份 SHA-256: ${restore_sha}"
+    local expected_sha="${SONGBOX_RESTORE_SHA256:-${VLESS_RESTORE_SHA256:-}}"
+    if [[ -n "$expected_sha" ]] && ! _verify_sha256 "$src" "$expected_sha"; then
+        _err "备份与 SONGBOX_RESTORE_SHA256 / VLESS_RESTORE_SHA256 不匹配，已拒绝恢复"
+        return 1
+    fi
 
     local -A avail_map=()
     local tmp; tmp=$(mktemp -d) || return 1
-    tar -xzf "$src" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; _err "解包失败"; return 1; }
-    if [[ ! -f "$tmp/etc/db.json" ]]; then
-        rm -rf "$tmp"; _err "备份包中缺少 etc/db.json，无法恢复"; return 1
-    fi
-    jq -e . "$tmp/etc/db.json" >/dev/null 2>&1 || {
+    _prepare_restore_package "$src" "$tmp" || { rm -rf "$tmp"; return 1; }
+    jq -e 'type == "object"' "$tmp/pkg/etc/db.json" >/dev/null 2>&1 || {
         rm -rf "$tmp"; _err "备份中的 db.json 不是合法 JSON"; return 1; }
     local backup_has_realm=false
-    [[ -s "$tmp/etc/realm/config.toml" ]] && backup_has_realm=true
+    [[ -s "$tmp/pkg/etc/realm/config.toml" ]] && backup_has_realm=true
+    local backup_has_site=false
+    [[ -f "$tmp/pkg/site/index.html" ]] && backup_has_site=true
 
     _line
     echo -e "  ${W}备份包信息${NC}" >&2
-    if [[ -f "$tmp/meta.txt" ]]; then sed 's/^/    /' "$tmp/meta.txt" >&2; fi
+    if [[ -f "$tmp/pkg/meta.txt" ]]; then sed 's/^/    /' "$tmp/pkg/meta.txt" >&2; fi
     _line
 
     #── 选择性恢复 ──────────────────────────────────────────────────────────────
-    local bk_db="$tmp/etc/db.json"
+    local bk_db="$tmp/pkg/etc/db.json"
     local avail=() ap
     while IFS= read -r ap; do [[ -n "$ap" ]] && avail+=("$ap"); done < <(
         jq -r '[((.singbox // {}) | keys[]), ((.snell // {}) | keys[])] | sort | .[]' "$bk_db" 2>/dev/null)
@@ -10788,34 +11152,127 @@ do_restore() {
     if [[ "$backup_has_realm" == "true" && "$keep_csv" == "all" ]]; then
         realm_restore=true
     else
-        rm -rf "$tmp/etc/realm"
+        rm -rf "$tmp/pkg/etc/realm"
     fi
 
-    if [[ -f "$DB_FILE" || -f "$REALM_CONF" ]]; then
-        _warn "当前服务器已有配置，恢复会覆盖 db.json / 证书 / WARP / 订阅 UUID / Realm 配置"
-        _ask_yes "确认继续?" || { rm -rf "$tmp"; _info "已取消"; return 0; }
-        cp -a "$DB_FILE" "${DB_FILE}.before-restore.bak" 2>/dev/null &&
-            _info "原 db.json 已备份为 ${DB_FILE}.before-restore.bak"
-        [[ -f "$REALM_CONF" ]] &&
-            cp -a "$REALM_CONF" "${REALM_CONF}.before-restore.bak" 2>/dev/null
-        stop_services
-        svc stop "$REALM_SVC" >/dev/null 2>&1 || true
+    [[ ! -e "$CFG" || -d "$CFG" ]] || { rm -rf "$tmp"; _err "$CFG 不是目录，无法安全恢复"; return 1; }
+    local has_existing=false
+    [[ -d "$CFG" || -d "$HOME/.acme.sh" || ( "$backup_has_site" == "true" && -d "$SITE_ROOT" ) ]] && has_existing=true
+    if [[ "$has_existing" == "true" ]]; then
+        _warn "当前服务器已有状态，恢复会原子替换 songbox 配置及备份中包含的 ACME / 伪装站内容"
+    fi
+    if [[ -z "$expected_sha" && -d "$tmp/pkg/acme" ]]; then
+        _warn "未提供外部可信哈希；备份中的 acme.sh 状态含可执行脚本"
+    fi
+    if [[ "${SONGBOX_RESTORE_ASSUME_YES:-0}" != "1" ]]; then
+        if [[ ! -t 0 ]]; then
+            rm -rf "$tmp"
+            _err "非交互恢复需要显式设置 SONGBOX_RESTORE_ASSUME_YES=1"
+            return 1
+        fi
+        _ask_yes "确认信任该备份并继续?" || { rm -rf "$tmp"; _info "已取消"; return 0; }
     fi
 
-    mkdir -p "$CFG"; chmod 711 "$CFG" 2>/dev/null
-    cp -a "$tmp/etc/." "$CFG/" || { rm -rf "$tmp"; _err "写入 $CFG 失败"; return 1; }
+    local restore_stamp cfg_stage cfg_previous="" acme_stage="" acme_previous=""
+    local site_stage="" site_previous="" acme_touched=false site_touched=false
+    restore_stamp="$(date '+%Y%m%d-%H%M%S')-$$"
+    mkdir -p "$(dirname "$CFG")" || { rm -rf "$tmp"; return 1; }
+    cfg_stage=$(mktemp -d "${CFG}.restore.XXXXXX") || { rm -rf "$tmp"; return 1; }
+    cp -a "$tmp/pkg/etc/." "$cfg_stage/" || {
+        rm -rf "$tmp" "$cfg_stage"; _err "暂存恢复配置失败"; return 1; }
+    _tree_safe "$cfg_stage" || {
+        rm -rf "$tmp" "$cfg_stage"; _err "暂存配置包含不安全文件"; return 1; }
+    chown -R root:root "$cfg_stage" 2>/dev/null || true
+    find "$cfg_stage" -type d -exec chmod 700 {} + 2>/dev/null
+    find "$cfg_stage" -type f -exec chmod 600 {} + 2>/dev/null
+
+    if [[ -d "$tmp/pkg/acme" ]]; then
+        acme_stage=$(mktemp -d "$HOME/.acme.sh.restore.XXXXXX") || {
+            rm -rf "$tmp" "$cfg_stage"; return 1; }
+        cp -a "$tmp/pkg/acme/." "$acme_stage/" || {
+            rm -rf "$tmp" "$cfg_stage" "$acme_stage"; _err "暂存 acme.sh 状态失败"; return 1; }
+        _tree_safe "$acme_stage" || {
+            rm -rf "$tmp" "$cfg_stage" "$acme_stage"; _err "acme.sh 状态包含不安全文件"; return 1; }
+        chown -R root:root "$acme_stage" 2>/dev/null || true
+        chmod -R go-w "$acme_stage" 2>/dev/null
+        acme_touched=true
+    fi
+
+    if [[ "$backup_has_site" == "true" ]]; then
+        mkdir -p "$(dirname "$SITE_ROOT")" || {
+            rm -rf "$tmp" "$cfg_stage" ${acme_stage:+"$acme_stage"}; return 1; }
+        site_stage=$(mktemp -d "${SITE_ROOT}.restore.XXXXXX") || {
+            rm -rf "$tmp" "$cfg_stage" ${acme_stage:+"$acme_stage"}; return 1; }
+        cp -a "$tmp/pkg/site/." "$site_stage/" || {
+            rm -rf "$tmp" "$cfg_stage" ${acme_stage:+"$acme_stage"} "$site_stage"
+            _err "暂存伪装站内容失败"; return 1
+        }
+        _tree_safe "$site_stage" || {
+            rm -rf "$tmp" "$cfg_stage" ${acme_stage:+"$acme_stage"} "$site_stage"
+            _err "伪装站内容包含不安全文件"; return 1
+        }
+        find "$site_stage" -type d -exec chmod 755 {} + 2>/dev/null
+        find "$site_stage" -type f -exec chmod 644 {} + 2>/dev/null
+        site_touched=true
+    fi
+
+    # 先按当前数据库停止旧服务，再切换目录；否则会按备份数据库漏停旧实例。
+    stop_services >/dev/null 2>&1 || true
+    svc stop "$REALM_SVC" >/dev/null 2>&1 || true
+    if [[ -d "$CFG" ]]; then
+        cfg_previous="${CFG}.before-restore-${restore_stamp}"
+        mv "$CFG" "$cfg_previous" || {
+            rm -rf "$tmp" "$cfg_stage" ${acme_stage:+"$acme_stage"} ${site_stage:+"$site_stage"}
+            _err "备份现有配置目录失败"; return 1
+        }
+    fi
+    if ! mv "$cfg_stage" "$CFG"; then
+        [[ -n "$cfg_previous" ]] && mv "$cfg_previous" "$CFG" 2>/dev/null
+        rm -rf "$tmp" ${acme_stage:+"$acme_stage"} ${site_stage:+"$site_stage"}
+        _err "切换恢复配置失败，已回滚"; return 1
+    fi
+
+    if [[ "$acme_touched" == "true" ]]; then
+        if [[ -d "$HOME/.acme.sh" ]]; then
+            acme_previous="$HOME/.acme.sh.before-restore-${restore_stamp}"
+            mv "$HOME/.acme.sh" "$acme_previous" || {
+                _rollback_restore_switch "$restore_stamp" "$cfg_previous" "" "" false false
+                rm -rf "$tmp" "$acme_stage" ${site_stage:+"$site_stage"}
+                _err "备份现有 acme.sh 状态失败，配置已回滚"; return 1
+            }
+        fi
+        if ! mv "$acme_stage" "$HOME/.acme.sh"; then
+            _rollback_restore_switch "$restore_stamp" "$cfg_previous" "$acme_previous" "" false false
+            rm -rf "$tmp" ${site_stage:+"$site_stage"}
+            _err "切换 acme.sh 状态失败，配置已回滚"; return 1
+        fi
+        _info "已恢复 acme.sh 账户与证书状态"
+    fi
+
+    if [[ "$site_touched" == "true" ]]; then
+        if [[ -d "$SITE_ROOT" ]]; then
+            site_previous="${SITE_ROOT}.before-restore-${restore_stamp}"
+            mv "$SITE_ROOT" "$site_previous" || {
+                _rollback_restore_switch "$restore_stamp" "$cfg_previous" "$acme_previous" "" "$acme_touched" false
+                rm -rf "$tmp" "$site_stage"; _err "备份现有伪装站失败，配置已回滚"; return 1
+            }
+        fi
+        if ! mv "$site_stage" "$SITE_ROOT"; then
+            _rollback_restore_switch "$restore_stamp" "$cfg_previous" "$acme_previous" "$site_previous" "$acme_touched" false
+            rm -rf "$tmp"; _err "切换伪装站内容失败，配置已回滚"; return 1
+        fi
+        _info "已恢复本机 HTTPS 伪装站内容"
+    fi
+
+    chmod 711 "$CFG" 2>/dev/null
     chmod 600 "$DB_FILE" 2>/dev/null
     [[ -d "$SSL_DIR" ]] && chmod 700 "$SSL_DIR" 2>/dev/null
     [[ -d "$REALM_DIR" ]] && chmod 700 "$REALM_DIR" 2>/dev/null
     [[ -f "$REALM_CONF" ]] && chmod 600 "$REALM_CONF" 2>/dev/null
-    if [[ -d "$tmp/acme" ]]; then
-        mkdir -p "$HOME/.acme.sh"
-        cp -a "$tmp/acme/." "$HOME/.acme.sh/" 2>/dev/null && _info "已恢复 acme.sh 账户与证书状态"
-    fi
-    rm -rf "$tmp"
-    _ok "配置文件已恢复"
+    _ok "配置文件已原子切换"
 
-    db_migrate_legacy
+    local restore_ok=true
+    db_migrate_legacy || restore_ok=false
 
     # 恢复过来的证书可能来自旧版本（没有 cert_meta）或另一台机器，
     # 这里重新识别来源并把自动续期链路补齐
@@ -10826,8 +11283,7 @@ do_restore() {
     fi
 
     _info "重建服务（缺失的内核二进制会自动补装）..."
-    local restore_ok=true
-    start_services || restore_ok=false
+    [[ "$restore_ok" == "true" ]] && start_services || restore_ok=false
     if [[ "$realm_restore" == "true" ]]; then
         _info "按当前系统的架构与 libc 重装 Realm 核心..."
         if ! install_realm_core true; then
@@ -10839,6 +11295,15 @@ do_restore() {
     if [[ "$restore_ok" == "true" ]]; then
         create_shortcut
         [[ -f "$CFG/sub.info" ]] && { install_nginx >/dev/null 2>&1 && generate_sub_files; }
+        if [[ "$backup_has_site" == "true" && -s "$SITE_PORT_FILE" ]]; then
+            local restored_site_port; restored_site_port=$(cat "$SITE_PORT_FILE" 2>/dev/null)
+            if _is_real_cert; then
+                setup_decoy_site "$restored_site_port" keep >/dev/null ||
+                    _warn "伪装站文件已恢复，但 Nginx 配置重建失败，请从菜单重试"
+            else
+                _warn "伪装站文件已恢复；当前证书不是可信证书，未自动启用 Nginx 站点"
+            fi
+        fi
         db_expired_users >/dev/null 2>&1 && install_expire_cron >/dev/null 2>&1
         sync_traffic_counters 2>/dev/null || true
         _dline
@@ -10848,17 +11313,33 @@ do_restore() {
         show_realm_summary
         echo "" >&2
         local oip nip
-        oip=$(tar -xzOf "$src" ./meta.txt 2>/dev/null | awk -F= '/^ipv4=/{print $2}')
+        oip=$(awk -F= '/^ipv4=/{print $2}' "$tmp/pkg/meta.txt" 2>/dev/null)
         nip=$(get_ipv4)
         if [[ -n "$oip" && -n "$nip" && "$oip" != "$nip" ]]; then
             _warn "服务器 IP 已变化: ${oip} → ${nip}"
             echo -e "  ${D}协议参数不变，但客户端里的服务器地址需要改成新 IP${NC}" >&2
             echo -e "  ${D}（若用域名接入且 DNS 已更新，客户端无需改动）${NC}" >&2
         fi
+        rm -rf "$tmp"
         echo -e "  ${C}建议执行「查看协议配置 / 分享链接」核对一遍${NC}" >&2
         return 0
     fi
-    _err "服务启动失败，配置已恢复，请查看日志排查"
+    if [[ "$has_existing" == "true" ]]; then
+        _warn "恢复后的服务验证失败，正在回滚到恢复前状态..."
+        stop_services >/dev/null 2>&1 || true
+        svc stop "$REALM_SVC" >/dev/null 2>&1 || true
+        _rollback_restore_switch "$restore_stamp" "$cfg_previous" "$acme_previous" "$site_previous" \
+            "$acme_touched" "$site_touched"
+        if [[ -f "$DB_FILE" ]]; then
+            start_services >/dev/null 2>&1 || _warn "原配置已还原，但旧服务需要手动启动"
+        fi
+        [[ -f "$REALM_CONF" ]] && realm_start_service >/dev/null 2>&1 || true
+        rm -rf "$tmp"
+        _err "恢复后的服务启动失败，已回滚；失败配置保留在 ${CFG}.failed-restore-${restore_stamp}"
+        return 1
+    fi
+    rm -rf "$tmp"
+    _err "服务启动失败；这是新服务器，没有旧配置可回滚，已保留恢复内容供排查"
     return 1
 }
 
@@ -10970,12 +11451,12 @@ main_menu() {
             14)
                 if [[ -z "$installed" && ! -f "$REALM_CONF" ]]; then
                     do_restore ""
-                elif true; then
+                else
                     _header
                     echo -e "  ${W}备份 / 恢复配置${NC}" >&2
                     _line
                     _item "1" "备份当前配置 ${D}(重装系统前导出)${NC}"
-                        _item "2" "从备份恢复 ${D}(可只恢复部分协议；完整恢复含 Realm)${NC}"
+                    _item "2" "从备份恢复 ${D}(可只恢复部分协议；完整恢复含 Realm)${NC}"
                     _item "0" "返回"
                     _line
                     local bc; read -rp "  请选择: " bc
@@ -10984,8 +11465,6 @@ main_menu() {
                         2) do_restore "" ;;
                     esac
                     skip=false
-                else
-                    _err "无效选择"
                 fi ;;
             15) realm_menu; skip=true ;;
             0)  exit 0 ;;
@@ -10998,6 +11477,10 @@ main_menu() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 命令行入口
 #═══════════════════════════════════════════════════════════════════════════════
+if [[ "${SONGBOX_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 case "${1:-}" in
     --check-expire)
         check_root; init_db
@@ -11033,14 +11516,10 @@ case "${1:-}" in
         do_restore "$2" "$_only"; exit $? ;;
     --list-backup)
         [[ -z "${2:-}" ]] && { echo "用法: $0 --list-backup <备份文件.tar.gz>"; exit 1; }
-        [[ -f "$2" ]] || { echo "文件不存在: $2"; exit 1; }
-        tar -xzOf "$2" ./meta.txt 2>/dev/null
-        echo "--- 协议与端口 ---"
-        tar -xzOf "$2" ./etc/db.json 2>/dev/null | jq -r '
-            [((.singbox // {}) | to_entries[]), ((.snell // {}) | to_entries[])]
-            | sort_by(.key)[]
-            | "\(.key)\t端口 \([.value[].port] | join(","))\t用户 \([.value[].users // [] | length] | add // 0)"'
-        exit 0 ;;
+        do_list_backup "$2"; exit $? ;;
+    --verify-backup)
+        [[ -z "${2:-}" ]] && { echo "用法: $0 --verify-backup <备份文件.tar.gz>"; exit 1; }
+        do_list_backup "$2" true; exit $? ;;
     --help|-h)
         cat <<EOF
 用法: $0 [选项]
@@ -11052,7 +11531,6 @@ case "${1:-}" in
   --show-traffic    显示端口级流量统计
   --cert-check      检查证书剩余天数，不足 20 天时自动续期（用于定时任务）
   --cert-status     显示证书状态与各协议 SNI
-  --firewall-status 审计本脚本写入的防火墙规则
   --firewall-status 审计脚本写入了哪些防火墙规则
   --cert-fix        重新识别现有证书并补齐自动续期链路（恢复备份后用）
   --realm-restart   重启 Realm 服务（供定时任务调用）
@@ -11061,6 +11539,8 @@ case "${1:-}" in
                     从备份恢复并重建服务；--only 可只恢复指定协议
   --list-backup <文件>
                     查看备份包里有哪些协议、端口、用户数（不做任何改动）
+  --verify-backup <文件>
+                    完整校验归档结构、文件类型、大小、哈希与 db.json
   --help, -h        显示帮助
 
 无参数时进入交互式菜单。

@@ -1,8 +1,8 @@
-# SingsongBox
+# songbox
 
 一个面向 Linux VPS 的交互式代理服务端管理脚本。它以 Sing-box 作为统一核心，并为 Snell 保留独立服务，帮助你在同一台服务器上安装、组合和维护多种 TCP、TLS、WebSocket 与 QUIC 协议。
 
-> 当前脚本版本：`v0.0.3`。项目需要 root 权限，会修改服务、证书、Nginx、防火墙和部分内核网络参数。请先了解变更范围，并仅用于合法、合规的网络用途。
+> 当前脚本版本：`v0.1.0`。项目需要 root 权限，会修改服务、证书、Nginx、防火墙和部分内核网络参数。请先了解变更范围，并仅用于合法、合规的网络用途。
 
 ## 项目特点
 
@@ -13,7 +13,8 @@
 - 客户端输出：生成分享链接、终端二维码以及 Clash/Mihomo、Surge、V2Ray 通用订阅。
 - 高级分流：支持链式代理、规则分流、多 IP 出口、WARP、访问限制和 geosite/geoip 规则集。
 - 中转能力：内置 Realm 管理，可将中转机端口原样转发至落地机。
-- 运维能力：服务启停、日志查看、配置重建、端口级流量统计、备份恢复和脚本更新。
+- 运维能力：服务启停、日志查看、配置重建、端口级流量统计、可验证备份、失败自动回滚和脚本更新。
+- 安全输入：API Token、密码、PSK、UUID、分享链接和订阅 URL 在 SSH 终端中关闭回显。
 - 网络优化：根据 VPS 配置自动生成 BBR/BBR3、IPv4、IPv6 与 conntrack 调优方案。
 
 ## 工作原理
@@ -68,13 +69,13 @@ Snell 使用独立二进制和独立服务；其余协议由 Sing-box 统一管�
 ### Debian
 
 ```bash
-sudo apt-get update && sudo apt-get install -y curl && curl -fsSL -o songbox.sh https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/songbox.sh && chmod +x songbox.sh && sudo ./songbox.sh
+sudo apt-get update && sudo apt-get install -y curl && curl -fsSL -o songbox.sh https://raw.githubusercontent.com/NeverF1ower/songbox/main/songbox.sh && chmod +x songbox.sh && sudo ./songbox.sh
 ```
 
 ### Ubuntu
 
 ```bash
-sudo apt update && sudo apt install -y curl && curl -fsSL -o songbox.sh https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/songbox.sh && chmod +x songbox.sh && sudo ./songbox.sh
+sudo apt update && sudo apt install -y curl && curl -fsSL -o songbox.sh https://raw.githubusercontent.com/NeverF1ower/songbox/main/songbox.sh && chmod +x songbox.sh && sudo ./songbox.sh
 ```
 
 ### Alpine Linux
@@ -82,7 +83,7 @@ sudo apt update && sudo apt install -y curl && curl -fsSL -o songbox.sh https://
 Alpine 默认不提供 Bash，以下命令请在 root 账户下执行：
 
 ```bash
-apk update && apk add --no-cache bash curl && curl -fsSL -o songbox.sh https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/songbox.sh && chmod +x songbox.sh && bash ./songbox.sh
+apk update && apk add --no-cache bash curl && curl -fsSL -o songbox.sh https://raw.githubusercontent.com/NeverF1ower/songbox/main/songbox.sh && chmod +x songbox.sh && bash ./songbox.sh
 ```
 
 首次成功安装协议后，脚本会创建快捷命令：
@@ -189,18 +190,32 @@ vless
 | `vless --firewall-status` | 审计脚本写入的防火墙规则 |
 | `vless --backup [路径]` | 导出配置、用户、密钥和证书备份 |
 | `vless --list-backup <文件>` | 只读查看备份中的协议、端口和用户数 |
+| `vless --verify-backup <文件>` | 校验归档结构、文件类型、大小、内部清单和 `db.json` |
 | `vless --restore <文件> [--only p1,p2]` | 完整或按协议恢复配置 |
 | `vless --help` | 查看命令行帮助 |
 
 备份示例：
 
 ```bash
-vless --backup /root/singingbox-backup.tar.gz
-vless --list-backup /root/singingbox-backup.tar.gz
-vless --restore /root/singingbox-backup.tar.gz --only vless-reality,hy2
+vless --backup /root/songbox-backup.tar.gz
+vless --verify-backup /root/songbox-backup.tar.gz
+vless --list-backup /root/songbox-backup.tar.gz
+vless --restore /root/songbox-backup.tar.gz --only vless-reality,hy2
 ```
 
-备份包包含代理凭据、用户信息和证书私钥，默认权限为 `600`。请及时下载到可信设备，并进行加密保存。
+新备份在发布前会调用恢复解析器自检，并写入覆盖包内全部普通文件的 `manifest.sha256`。恢复会先在临时目录完成路径、文件类型、体积、清单与 JSON 校验，再原子切换配置；新服务启动失败时自动回滚旧配置。兼容旧版的 `db.json`、`etc/db.json`、`etc/vless-reality/db.json`、外层包装目录、`root/.acme.sh` 和 `var/www/decoy` 布局。
+
+跨机器传输时建议在可信设备另存整个备份的 SHA-256，并在恢复前传入；包内清单能发现损坏和漏文件，但不能代替外部可信哈希：
+
+```bash
+SONGBOX_RESTORE_SHA256='<64位哈希>' vless --restore /root/songbox-backup.tar.gz
+```
+
+非交互恢复还必须显式设置 `SONGBOX_RESTORE_ASSUME_YES=1`。备份包包含代理凭据、用户信息、DNS API 凭据和证书私钥，默认权限为 `600`；请及时下载到可信设备并加密保存。
+
+## 伪装站资源
+
+仓库的 [`assets/decoy-sites`](assets/decoy-sites) 提供三个无外部依赖的单文件模板：服务状态页、产品文档页和个人作品页。脚本直接从本仓库读取并校验 HTML，不再依赖第三方模板压缩包。你也可以先修改模板内容，再部署自己的分支。
 
 ## 重要文件
 
@@ -211,8 +226,9 @@ vless --restore /root/singingbox-backup.tar.gz --only vless-reality,hy2
 | `/etc/vless-reality/certs/` | 证书和私钥 |
 | `/etc/vless-reality/ruleset/` | geosite/geoip 规则集缓存 |
 | `/usr/local/bin/sing-box` | Sing-box 二进制 |
-| `/usr/local/bin/vless-server.sh` | 安装后的管理脚本 |
-| `/usr/local/bin/vless` | 管理脚本快捷命令 |
+| `/usr/local/bin/songbox.sh` | 安装后的规范管理脚本 |
+| `/usr/local/bin/vless-server.sh` | 兼容旧安装的符号链接 |
+| `/usr/local/bin/vless`、`/usr/bin/vless` | 管理脚本快捷命令 |
 | `/var/log/vless-server.log` | 脚本运行日志 |
 | `/etc/sysctl.d/99-zz-vless-tuning.conf` | 网络优化生成的 sysctl 配置 |
 
@@ -241,7 +257,11 @@ vless --backup
 
 ## 更新
 
-可在主菜单选择“检查脚本更新”，也可以重新下载最新版 `songbox.sh`。脚本会保留旧脚本备份，并尝试同步系统快捷命令。
+可在主菜单选择“检查脚本更新”，也可以重新下载最新版 `songbox.sh`。`v0.1.0` 起规范安装路径改为 `/usr/local/bin/songbox.sh`，快捷命令仍是 `vless`。
+
+旧 VPS 可以直接在旧版菜单中执行“检查脚本更新”：旧脚本会从原仓库地址下载新版，新版首次启动后会迁移到规范路径，并把 `/usr/local/bin/vless-server.sh` 改成兼容链接；旧文件会保留为 `.pre-songbox.bak`。新版更新器同时尝试新旧仓库地址，仓库改名期间不会中断升级链路。原有 `/etc/vless-reality` 配置和服务名保持不变。
+
+第三方下载镜像默认关闭。只有在你确认镜像可信时才应临时设置 `ALLOW_THIRD_PARTY_MIRRORS=1`；官方发布未提供 SHA-256 时，交互模式会要求确认，非交互模式默认拒绝。
 
 问题反馈时，请提供系统发行版、CPU 架构、内核版本、脚本版本、所用协议和脱敏后的错误日志；请务必删除所有凭据与公网订阅路径。
 
