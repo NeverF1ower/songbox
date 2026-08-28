@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Northstar Systems Status</title>
+  <style>
+    :root{color-scheme:light;--ink:#172033;--muted:#667085;--line:#e4e7ec;--ok:#12b76a;--bg:#f8fafc}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}
+    main{width:min(760px,calc(100% - 32px));margin:9vh auto}.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}
+    .brand{font-weight:700;letter-spacing:.02em}.stamp{color:var(--muted);font-size:13px}.card{background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:0 12px 35px rgba(16,24,40,.06);overflow:hidden}
+    .summary{padding:28px;display:flex;gap:14px;align-items:center;border-bottom:1px solid var(--line)}.dot{width:13px;height:13px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 6px #d1fadf}
+    h1{font-size:22px;margin:0}.summary p{margin:3px 0 0;color:var(--muted)}.service{display:grid;grid-template-columns:1fr auto;gap:16px;padding:18px 28px;border-bottom:1px solid var(--line)}.service:last-child{border:0}
+    .service b{font-size:14px}.service span{color:var(--ok);font-size:13px;font-weight:650}.service small{display:block;color:var(--muted);margin-top:2px}
+    footer{color:var(--muted);font-size:12px;text-align:center;margin-top:24px}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="top"><div class="brand">Northstar Systems</div><div class="stamp">Service health</div></div>
+    <section class="card">
+      <div class="summary"><div class="dot"></div><div><h1>All systems operational</h1><p>No incidents have been reported.</p></div></div>
+      <div class="service"><div><b>Public API</b><small>Requests and authentication</small></div><span>Operational</span></div>
+      <div class="service"><div><b>Dashboard</b><small>Web application and assets</small></div><span>Operational</span></div>
+      <div class="service"><div><b>Background jobs</b><small>Queues and scheduled processing</small></div><span>Operational</span></div>
+    </section>
+    <footer>Availability information is updated automatically.</footer>
+  </main>
+</body>
+</html>
