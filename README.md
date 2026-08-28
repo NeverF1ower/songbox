@@ -215,7 +215,9 @@ SONGBOX_RESTORE_SHA256='<64位哈希>' vless --restore /root/songbox-backup.tar.
 
 ## 伪装站资源
 
-仓库的 [`assets/decoy-sites`](assets/decoy-sites) 提供三个无外部依赖的单文件模板：服务状态页、产品文档页和个人作品页。脚本直接从本仓库读取并校验 HTML，不再依赖第三方模板压缩包。你也可以先修改模板内容，再部署自己的分支。
+仓库的 [`assets/decoy-sites`](assets/decoy-sites) 提供三个无外部依赖的原创单文件模板：服务状态页、产品文档页和个人作品页。脚本同时恢复了 v2ray-agent 当前的 `html1.zip`–`html9.zip` 九套完整静态站入口（旧版本曾只随机选择 1–6）：新手引导、游戏网站、个人博客、企业站、音乐解锁工具、mikutap、第二套企业站、第二套个人博客和 404 跳转页。
+
+九个第三方压缩包固定到 v2ray-agent 的具体提交，不跟随 `master` 漂移；下载后必须通过仓库记录的 SHA-256、归档路径和解包文件类型检查才会部署。约 36 MiB 的压缩包没有复制进 songbox Git 历史，来源、许可证和哈希记录见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 与 [`v2ray-agent.sha256`](assets/decoy-sites/v2ray-agent.sha256)。下载失败时仍可使用三套 songbox 轻量页或内置极简页。
 
 ## 重要文件
 
@@ -264,4 +266,3 @@ vless --backup
 第三方下载镜像默认关闭。只有在你确认镜像可信时才应临时设置 `ALLOW_THIRD_PARTY_MIRRORS=1`；官方发布未提供 SHA-256 时，交互模式会要求确认，非交互模式默认拒绝。
 
 问题反馈时，请提供系统发行版、CPU 架构、内核版本、脚本版本、所用协议和脱敏后的错误日志；请务必删除所有凭据与公网订阅路径。
-

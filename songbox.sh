@@ -2998,29 +2998,48 @@ decoy_site_running() {
     _port_listening "$port"
 }
 
-# 项目仓库内置的原创静态模板，避免运行时依赖第三方模板仓库。
-readonly DECOY_TPL_BASE="${SONGBOX_ASSET_RAW_BASE:-https://raw.githubusercontent.com/NeverF1ower/songbox/main/assets/decoy-sites}"
-readonly LEGACY_DECOY_TPL_BASE="https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/assets/decoy-sites"
+# v2ray-agent 当前提供 9 套静态站。固定到已审计提交并逐包校验 SHA-256，
+# 避免跟随 master 变动；仓库内的 3 套原创轻量页继续作为备用。
+readonly V2RAY_AGENT_DECOY_COMMIT="89388ca675af39c70e72f9174c1f112b04613703"
+readonly V2RAY_AGENT_DECOY_BASE="${SONGBOX_V2RAY_AGENT_ASSET_BASE:-https://raw.githubusercontent.com/mack-a/v2ray-agent/${V2RAY_AGENT_DECOY_COMMIT}/fodder/blog/unable}"
 declare -rA DECOY_TPL_NAME=(
+    [1]="新手引导" [2]="游戏网站" [3]="个人博客 01" [4]="企业站 01"
+    [5]="音乐解锁工具" [6]="mikutap 互动页" [7]="企业站 02"
+    [8]="个人博客 02" [9]="404 跳转页"
+)
+declare -rA DECOY_TPL_SHA256=(
+    [1]="a226ca42b854e3cd3585d57bfb9f8c6f09d4d195dbe5fbf41c5358cd7540631b"
+    [2]="42e9f76fdf8df0af7a07dc1408a1e3caac7db6691f3ff49aabe38913eb0bbb75"
+    [3]="3e8e4835c54e9c3ca4d771db4c2256d5af9dde3d2d19bd2f41364afc9079d75e"
+    [4]="6e17ee5a6d8db1e266139694dfacb11ea379dbbfbf2342f3024fd8cd709f0156"
+    [5]="faf987332c287e347e67a47f48390966b8377c2f9c66bdcf24a435e99690bb4f"
+    [6]="d06c145330f46587a6f8c91c0ba7acdf3a3224bf028d87726f31e88162ee725a"
+    [7]="bf0d0e7cc1ecbf9663d326603e9262c7f30c9fcc939c1ace8522b05c92cb376a"
+    [8]="01b510bd8efe94ecc9b6c585c87261f849a8ed91f1323e8e1764b6c596de8e68"
+    [9]="eb7eb42a7c07c3bfd71c97d6b309fadf22924195e2b84b2ce420766a5c7162ff"
+)
+
+readonly SONGBOX_DECOY_TPL_BASE="${SONGBOX_ASSET_RAW_BASE:-https://raw.githubusercontent.com/NeverF1ower/songbox/main/assets/decoy-sites}"
+readonly LEGACY_SONGBOX_DECOY_TPL_BASE="https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/assets/decoy-sites"
+declare -rA SONGBOX_DECOY_TPL_NAME=(
     [1]="服务状态页" [2]="产品文档页" [3]="个人作品页"
 )
-declare -rA DECOY_TPL_FILE=(
+declare -rA SONGBOX_DECOY_TPL_FILE=(
     [1]="status.html" [2]="docs.html" [3]="portfolio.html"
 )
 
-# 从本仓库下载并铺设单文件静态模板
-# _install_decoy_template <编号|random>
-_install_decoy_template() {
+# 从 songbox 仓库下载并铺设原创单文件静态模板。
+_install_songbox_decoy_template() {
     local n="$1" url base tmp html filename size ok=false
     [[ "$n" == "random" ]] && n=$(( ($(od -An -tu4 -N4 /dev/urandom 2>/dev/null | tr -d ' ') % 3) + 1 ))
     [[ "$n" =~ ^[1-3]$ ]] || { _err "模板编号无效"; return 1; }
-    filename="${DECOY_TPL_FILE[$n]}"
+    filename="${SONGBOX_DECOY_TPL_FILE[$n]}"
     tmp=$(mktemp -d) || return 1
     html="$tmp/index.html"
-    for base in "$DECOY_TPL_BASE" "$LEGACY_DECOY_TPL_BASE"; do
+    for base in "$SONGBOX_DECOY_TPL_BASE" "$LEGACY_SONGBOX_DECOY_TPL_BASE"; do
         while IFS= read -r url; do
             [[ -z "$url" ]] && continue
-        _info "下载伪装站模板 ${n} (${DECOY_TPL_NAME[$n]}) ..."
+            _info "下载 songbox 轻量模板 ${n} (${SONGBOX_DECOY_TPL_NAME[$n]}) ..."
             if curl -fsSL --proto '=https' --connect-timeout 12 --max-time 60 \
                -o "$html" "$url" 2>/dev/null; then
                 size=$(stat -c%s "$html" 2>/dev/null || echo 0)
@@ -3031,7 +3050,7 @@ _install_decoy_template() {
             fi
             : >"$html"
         done < <(_raw_mirrors "${base}/${filename}")
-        [[ "$base" == "$DECOY_TPL_BASE" ]] && {
+        [[ "$base" == "$SONGBOX_DECOY_TPL_BASE" ]] && {
             _warn "新仓库资源地址不可用，尝试旧仓库兼容地址"
         }
     done
@@ -3046,10 +3065,74 @@ _install_decoy_template() {
     install -m 644 "$html" "$SITE_ROOT/index.html" || {
         rm -rf "$tmp"; _err "模板写入失败"; return 1
     }
-    printf '%s\n' "$filename" >"$SITE_ROOT/.tpl"
+    printf 'songbox:%s\n' "$n" >"$SITE_ROOT/.tpl"
     chmod 644 "$SITE_ROOT/.tpl"
     rm -rf "$tmp"
-    _ok "伪装站模板已铺设: ${n} (${DECOY_TPL_NAME[$n]})"
+    _ok "songbox 轻量模板已铺设: ${n} (${SONGBOX_DECOY_TPL_NAME[$n]})"
+}
+
+# 下载并安全铺设 v2ray-agent 1-9 模板。压缩包不进入本仓库，避免约 36 MiB
+# 的 Git 历史膨胀；来源提交与哈希记录在 assets/decoy-sites/v2ray-agent.sha256。
+_install_v2ray_agent_decoy_template() {
+    local n="$1" url tmp zip extract size ok=false
+    [[ "$n" == "random" ]] && n=$(( ($(od -An -tu4 -N4 /dev/urandom 2>/dev/null | tr -d ' ') % 9) + 1 ))
+    [[ "$n" =~ ^[1-9]$ ]] || { _err "v2ray-agent 模板编号无效"; return 1; }
+    check_cmd unzip || { _err "缺少 unzip，无法安装完整静态站模板"; return 1; }
+    tmp=$(mktemp -d) || return 1
+    zip="$tmp/html${n}.zip"; extract="$tmp/extract"
+    mkdir -p "$extract"
+    while IFS= read -r url; do
+        [[ -z "$url" ]] && continue
+        _info "下载 v2ray-agent 模板 ${n} (${DECOY_TPL_NAME[$n]}) ..."
+        if curl -fsSL --proto '=https' --connect-timeout 15 --max-time 180 \
+           -o "$zip" "$url" 2>/dev/null; then
+            size=$(stat -c%s "$zip" 2>/dev/null || echo 0)
+            if (( size >= 10240 && size <= 33554432 )) &&
+               _verify_sha256 "$zip" "${DECOY_TPL_SHA256[$n]}" &&
+               _archive_safe "$zip" zip; then
+                ok=true; break
+            fi
+            _warn "模板 ${n} 的大小、SHA-256 或归档结构校验失败"
+        fi
+        : >"$zip"
+    done < <(_raw_mirrors "${V2RAY_AGENT_DECOY_BASE}/html${n}.zip")
+    [[ "$ok" == "true" ]] || {
+        rm -rf "$tmp"; _err "v2ray-agent 模板 ${n} 下载或校验失败"; return 1; }
+    unzip -oq "$zip" -d "$extract" || {
+        rm -rf "$tmp"; _err "v2ray-agent 模板解包失败"; return 1; }
+    _tree_safe "$extract" || {
+        rm -rf "$tmp"; _err "v2ray-agent 模板包含链接或特殊文件"; return 1; }
+    [[ -s "$extract/index.html" ]] || {
+        rm -rf "$tmp"; _err "v2ray-agent 模板缺少根目录 index.html"; return 1; }
+    rm -rf "$extract/__MACOSX" 2>/dev/null
+    find "$extract" -name '.DS_Store' -type f -delete 2>/dev/null
+
+    mkdir -p "$SITE_ROOT"
+    find "$SITE_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+    cp -a "$extract/." "$SITE_ROOT/" || {
+        rm -rf "$tmp"; _err "v2ray-agent 模板写入失败"; return 1; }
+    printf 'v2ray-agent:%s\n' "$n" >"$SITE_ROOT/.tpl"
+    find "$SITE_ROOT" -type d -exec chmod 755 {} + 2>/dev/null
+    find "$SITE_ROOT" -type f -exec chmod 644 {} + 2>/dev/null
+    rm -rf "$tmp"
+    _ok "v2ray-agent 模板已铺设: ${n} (${DECOY_TPL_NAME[$n]})"
+}
+
+_decoy_tpl_description() {
+    local tpl="$1" n i
+    case "$tpl" in
+        v2ray-agent:[1-9]) n="${tpl#*:}"; echo "v2ray-agent 模板 ${n} (${DECOY_TPL_NAME[$n]})" ;;
+        songbox:[1-3]) n="${tpl#*:}"; echo "songbox 轻量模板 ${n} (${SONGBOX_DECOY_TPL_NAME[$n]})" ;;
+        [1-9]) echo "v2ray-agent 旧版模板 ${tpl} (${DECOY_TPL_NAME[$tpl]})" ;;
+        *.html)
+            for i in 1 2 3; do
+                [[ "${SONGBOX_DECOY_TPL_FILE[$i]}" == "$tpl" ]] && {
+                    echo "songbox 轻量模板 ${i} (${SONGBOX_DECOY_TPL_NAME[$i]})"; return; }
+            done
+            echo "未知模板 (${tpl})" ;;
+        "") echo "内置极简页" ;;
+        *) echo "自定义内容 (${tpl})" ;;
+    esac
 }
 
 # 选择伪装站内容
@@ -3059,22 +3142,30 @@ _choose_decoy_content() {
     echo -e "  ${W}伪装站页面${NC}" >&2
     echo -e "  ${D}探测者直连该端口时看到的就是这个网站，越像正常站点越好${NC}" >&2
     _line
-    _item "1" "songbox 仓库模板 ${D}(3 套原创单页，随机)${NC}"
-    _item "2" "songbox 仓库模板 ${D}(手动指定编号)${NC}"
-    _item "3" "内置极简页 ${D}(Service Status，体积最小)${NC}"
-    _item "4" "保留现有内容 ${D}(${SITE_ROOT})${NC}"
+    _item "1" "v2ray-agent 完整模板 ${D}(9 套，随机)${NC}"
+    _item "2" "v2ray-agent 完整模板 ${D}(手动指定 1-9)${NC}"
+    _item "3" "songbox 轻量模板 ${D}(3 套原创单页，随机)${NC}"
+    _item "4" "songbox 轻量模板 ${D}(手动指定 1-3)${NC}"
+    _item "5" "内置极简页 ${D}(Service Status，体积最小)${NC}"
+    _item "6" "保留现有内容 ${D}(${SITE_ROOT})${NC}"
     _line
     local c; read -rp "  请选择 [1]: " c
     case "${c:-1}" in
         2)
             local i
-            for i in 1 2 3; do _item "$i" "${DECOY_TPL_NAME[$i]}"; done
+            for i in 1 2 3 4 5 6 7 8 9; do _item "$i" "${DECOY_TPL_NAME[$i]}"; done
+            local n; read -rp "  模板编号 [3]: " n
+            _install_v2ray_agent_decoy_template "${n:-3}" || _write_decoy_page ;;
+        3) _install_songbox_decoy_template random || _write_decoy_page ;;
+        4)
+            local i
+            for i in 1 2 3; do _item "$i" "${SONGBOX_DECOY_TPL_NAME[$i]}"; done
             local n; read -rp "  模板编号 [1]: " n
-            _install_decoy_template "${n:-1}" || _write_decoy_page ;;
-        3) rm -f "$SITE_ROOT/.tpl"; find "$SITE_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+            _install_songbox_decoy_template "${n:-1}" || _write_decoy_page ;;
+        5) rm -f "$SITE_ROOT/.tpl"; find "$SITE_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
            _write_decoy_page ;;
-        4) [[ -f "$SITE_ROOT/index.html" ]] || { _warn "现有内容为空，改用内置页"; _write_decoy_page; } ;;
-        *) _install_decoy_template random || _write_decoy_page ;;
+        6) [[ -f "$SITE_ROOT/index.html" ]] || { _warn "现有内容为空，改用内置页"; _write_decoy_page; } ;;
+        *) _install_v2ray_agent_decoy_template random || _write_decoy_page ;;
     esac
 }
 
@@ -3340,8 +3431,7 @@ select_handshake_target() {
                 # 已有伪装站也要给出改端口/换页面的入口，不能默默复用
                 local tpl tpl_desc
                 tpl=$(cat "$SITE_ROOT/.tpl" 2>/dev/null)
-                if [[ -n "$tpl" ]]; then tpl_desc="v2ray-agent 模板 ${tpl} (${DECOY_TPL_NAME[$tpl]:-未知})"
-                else tpl_desc="内置极简页"; fi
+                tpl_desc=$(_decoy_tpl_description "$tpl")
                 echo "" >&2
                 _line
                 echo -e "  ${W}检测到已有本机 HTTPS 伪装站${NC}" >&2
