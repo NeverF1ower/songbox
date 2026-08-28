@@ -1658,7 +1658,7 @@ _ca_display() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 非自签即视为 CA 签发（issuer != subject）
 _is_real_cert() {
-    local crt="${1:-$SSL_DIR/server.crt}"
+    local crt="$SSL_DIR/server.crt"
     [[ -s "$crt" ]] || return 1
     local issuer subject
     issuer=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null | sed 's/^issuer= *//')
@@ -1699,7 +1699,7 @@ _cert_covers() {
 
 # 证书剩余天数（输出整数，可能为负）
 _cert_days_left() {
-    local crt="${1:-$SSL_DIR/server.crt}" na exp now
+    local crt="$SSL_DIR/server.crt" na exp now
     [[ -s "$crt" ]] || return 1
     na=$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2)
     [[ -z "$na" ]] && return 1
@@ -1710,16 +1710,16 @@ _cert_days_left() {
 
 # 证书与私钥是否配对
 _cert_key_match() {
-    local crt="${1:-$SSL_DIR/server.crt}" key="${2:-$SSL_DIR/server.key}" a b
+    local crt="$SSL_DIR/server.crt" key="$SSL_DIR/server.key" a b
     [[ -s "$crt" && -s "$key" ]] || return 1
     a=$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null)
     b=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl md5 2>/dev/null)
     [[ -n "$a" && "$a" == "$b" ]]
 }
 
-# 综合校验：存在 / 配对 / 未过期 /（可选）覆盖指定域名
+# 综合校验：存在 / 配对 / 未过期
 verify_cert() {
-    local expect="${1:-}" days
+    local days
     if [[ ! -s "$SSL_DIR/server.crt" || ! -s "$SSL_DIR/server.key" ]]; then
         _err "证书文件缺失: $SSL_DIR/server.crt"; return 1
     fi
@@ -1732,11 +1732,6 @@ verify_cert() {
     days=$(_cert_days_left)
     if [[ -n "$days" && "$days" -lt 0 ]]; then
         _err "证书已过期 ${days#-} 天"; return 1
-    fi
-    if [[ -n "$expect" ]] && ! _cert_covers "$expect"; then
-        _err "证书未覆盖域名 ${expect}"
-        echo -e "  ${D}证书包含: $(_cert_names | tr '\n' ' ')${NC}" >&2
-        return 1
     fi
     _ok "证书校验通过$( [[ -n "$days" ]] && echo "（剩余 ${days} 天）" )"
     return 0
@@ -2478,7 +2473,7 @@ _acme_conf_get() {
 
 # 从证书 issuer 判断 CA —— 比读 acme.sh conf 可靠，优先用它
 _ca_from_issuer() {
-    local crt="${1:-$SSL_DIR/server.crt}" issuer
+    local crt="$SSL_DIR/server.crt" issuer
     issuer=$(openssl x509 -in "$crt" -noout -issuer 2>/dev/null)
     [[ -z "$issuer" ]] && { echo "unknown"; return 1; }
     case "$issuer" in
@@ -8130,9 +8125,8 @@ _ask_port() {  # _ask_port <proto> [replace_port]
     done
 }
 
-_ask_sni() {  # _ask_sni [cert_domain]
-    local cert_domain="${1:-}" def; def=$(gen_sni)
-    if [[ -n "$cert_domain" ]]; then echo "$cert_domain"; return 0; fi
+_ask_sni() {
+    local def; def=$(gen_sni)
     echo "" >&2
     _line
     echo -e "  ${W}伪装域名 (SNI / 握手目标)${NC}" >&2
