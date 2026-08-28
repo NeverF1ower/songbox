@@ -31,3 +31,4 @@ jobs:
           bash tests/test_backup_restore.sh
           bash tests/test_name_compat.sh
           bash tests/test_decoy_templates.sh
+          bash tests/test_subscription_sync.sh
