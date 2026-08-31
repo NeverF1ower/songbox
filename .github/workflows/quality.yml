@@ -32,3 +32,28 @@ jobs:
           bash tests/test_name_compat.sh
           bash tests/test_decoy_templates.sh
           bash tests/test_subscription_sync.sh
+          bash tests/test_singbox_upgrade.sh
+
+  singbox-config-compat:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        singbox: ["1.13.12", "1.14.0"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install test dependency
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Download official sing-box ${{ matrix.singbox }}
+        env:
+          SB_VERSION: ${{ matrix.singbox }}
+        run: |
+          archive="$RUNNER_TEMP/sing-box.tar.gz"
+          curl -fL --retry 2 -o "$archive" \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          mkdir -p "$RUNNER_TEMP/sing-box"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/sing-box" --strip-components=1
+      - name: Validate generated configuration with sing-box ${{ matrix.singbox }}
+        env:
+          SONGBOX_TEST_SB_BIN: ${{ runner.temp }}/sing-box/sing-box
+        run: bash tests/test_singbox_compat.sh

@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  songbox v0.1.1 [Sing-box 统一内核]
+#  songbox v0.1.2 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -25,10 +25,10 @@ fi
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.1.1"
+readonly VERSION="0.1.2"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="songbox"
-readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync"
+readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14"
 
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（保留 VLESS_* 环境变量，兼容已安装的旧版本）
@@ -44,7 +44,7 @@ readonly CFG="${SONGBOX_CFG_DIR:-/etc/vless-reality}"
 readonly DB_FILE="$CFG/db.json"
 readonly DB_LOCK_FILE="$CFG/.db.lock"
 readonly SB_CONFIG="$CFG/singbox.json"
-readonly SB_BIN="/usr/local/bin/sing-box"
+readonly SB_BIN="${SONGBOX_SB_BIN:-/usr/local/bin/sing-box}"
 readonly SB_SVC="vless-singbox"
 readonly REALM_DIR="$CFG/realm"
 readonly REALM_BIN="$REALM_DIR/realm"
@@ -1259,10 +1259,13 @@ _verify_sha256() {  # file expected
     [[ "$a" == "$e" ]]
 }
 
-_sb_version() {
-    [[ -x "$SB_BIN" ]] || { echo ""; return; }
-    "$SB_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)?' | head -1
+_singbox_binary_version() {  # _singbox_binary_version <binary>
+    local binary="$1"
+    [[ -x "$binary" ]] || { echo ""; return; }
+    "$binary" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)?' | head -1
 }
+
+_sb_version() { _singbox_binary_version "$SB_BIN"; }
 
 _version_ge() {  # _version_ge a b -> a >= b
     local i raw_a raw_b
@@ -1300,45 +1303,68 @@ _confirm_unverified() {  # _confirm_unverified <名称>
     return 1
 }
 
-install_singbox() {
-    local force="${1:-false}" ver_override="${2:-}"
-    local cur; cur=$(_sb_version)
-    if [[ -n "$cur" && "$force" != "true" ]]; then
-        if _version_ge "$cur" "$SB_MIN_VERSION"; then _ok "Sing-box 已安装 (v$cur)"; return 0; fi
-        _warn "Sing-box v$cur 版本过低（需 >= $SB_MIN_VERSION），将升级"
-    fi
-
-    local arch; arch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构: $(uname -m)"; return 1; }
-    [[ "$DISTRO" == "alpine" ]] && apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
-
-    local ver="$ver_override"
+_resolve_singbox_version() {  # _resolve_singbox_version [override]
+    local ver="${1:-}" tag
     if [[ -z "$ver" ]]; then
-        local tag; tag=$(_gh_latest_tag "SagerNet/sing-box")
+        tag=$(_gh_latest_tag "SagerNet/sing-box")
         ver="${tag#v}"
     fi
-    [[ -z "$ver" ]] && { _err "获取 Sing-box 版本失败，请检查网络"; return 1; }
+    ver="${ver#v}"
+    [[ -n "$ver" ]] || { _err "获取 Sing-box 版本失败，请检查网络"; return 1; }
     [[ "$ver" =~ ^[0-9A-Za-z._-]+$ ]] || { _err "无效版本号: $ver"; return 1; }
+    echo "$ver"
+}
 
-    _info "安装 Sing-box v${ver} (linux-${arch})..."
-    local asset="sing-box-${ver}-linux-${arch}.tar.gz"
-    local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${asset}"
-    local tmp; tmp=$(mktemp -d) || return 1
+_download_singbox_binary() {  # _download_singbox_binary <version> <destination>
+    local ver="$1" destination="$2" arch asset url tmp expect found verified actual
+    arch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构: $(uname -m)"; return 1; }
+    [[ "$DISTRO" == "alpine" ]] && apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
+
+    asset="sing-box-${ver}-linux-${arch}.tar.gz"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${asset}"
+    tmp=$(mktemp -d) || return 1
     if ! curl -fsSL --connect-timeout 30 --retry 2 -o "$tmp/pkg.tar.gz" "$url"; then
         rm -rf "$tmp"; _err "下载失败: $url"; return 1
     fi
-    local expect; expect=$(_gh_asset_sha256 "SagerNet/sing-box" "v${ver}" "$asset" 2>/dev/null)
+    expect=$(_gh_asset_sha256 "SagerNet/sing-box" "v${ver}" "$asset" 2>/dev/null)
     if [[ -n "$expect" ]]; then
         _verify_sha256 "$tmp/pkg.tar.gz" "$expect" || {
             rm -rf "$tmp"; _err "Sing-box SHA-256 校验失败，已拒绝安装"; return 1; }
     else
         _confirm_unverified "Sing-box v${ver}" || { rm -rf "$tmp"; return 1; }
     fi
-    _archive_safe "$tmp/pkg.tar.gz" tar.gz || { rm -rf "$tmp"; _err "压缩包路径校验失败"; return 1; }
-    tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || { rm -rf "$tmp"; _err "解压失败"; return 1; }
-    local bin; bin=$(find "$tmp" -type f -name 'sing-box' -print -quit)
-    [[ -z "$bin" ]] && { rm -rf "$tmp"; _err "未找到 sing-box 二进制"; return 1; }
-    install -m 755 "$bin" "$SB_BIN" || { rm -rf "$tmp"; _err "安装失败"; return 1; }
+    _archive_safe "$tmp/pkg.tar.gz" tar.gz || {
+        rm -rf "$tmp"; _err "压缩包路径校验失败"; return 1; }
+    tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || {
+        rm -rf "$tmp"; _err "解压失败"; return 1; }
+    found=$(find "$tmp" -type f -name 'sing-box' -print -quit)
+    [[ -n "$found" ]] || { rm -rf "$tmp"; _err "未找到 sing-box 二进制"; return 1; }
+    verified="$tmp/sing-box.verified"
+    install -m 755 "$found" "$verified" || {
+        rm -rf "$tmp"; _err "暂存 Sing-box 失败"; return 1; }
+
+    actual=$(_singbox_binary_version "$verified")
+    if [[ "$actual" != "$ver" ]]; then
+        rm -rf "$tmp"
+        _err "Sing-box 版本校验失败（期望 ${ver}，实际 ${actual:-无法运行}）"
+        return 1
+    fi
+    install -m 755 "$verified" "$destination" || {
+        rm -rf "$tmp"; _err "写入 Sing-box 候选核心失败"; return 1; }
     rm -rf "$tmp"
+    return 0
+}
+
+install_singbox() {
+    local cur; cur=$(_sb_version)
+    if [[ -n "$cur" ]]; then
+        if _version_ge "$cur" "$SB_MIN_VERSION"; then _ok "Sing-box 已安装 (v$cur)"; return 0; fi
+        _warn "Sing-box v$cur 版本过低（需 >= $SB_MIN_VERSION），将升级"
+    fi
+
+    local ver; ver=$(_resolve_singbox_version) || return 1
+    _info "安装 Sing-box v${ver}..."
+    _download_singbox_binary "$ver" "$SB_BIN" || return 1
 
     cur=$(_sb_version)
     [[ -z "$cur" ]] && { _err "Sing-box 安装后无法运行"; return 1; }
@@ -4330,12 +4356,13 @@ _sb_inbound_raw() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 出站生成
 #═══════════════════════════════════════════════════════════════════════════════
-# sing-box 1.12 起 outbound.domain_strategy 被废弃，1.14 将移除。
+# sing-box 1.12 起 outbound.domain_strategy 被废弃，1.14 已移除。
 # 新写法是 outbound.domain_resolver = {server, strategy}，需要 dns.servers 里有对应 tag。
 # 这里按实际内核版本选择写法，老内核继续用 legacy 字段。
 readonly SB_DNS_TAG="dns-local"
 _sb_uses_legacy_domain_strategy() {
-    local v; v=$(_sb_version 2>/dev/null)
+    local v="${SONGBOX_SB_VERSION_OVERRIDE:-}"
+    [[ -n "$v" ]] || v=$(_sb_version 2>/dev/null)
     [[ -z "$v" ]] && return 1
     _version_ge "$v" "1.12" && return 1
     return 0
@@ -4641,13 +4668,14 @@ _match_conditions() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 主配置生成
 #═══════════════════════════════════════════════════════════════════════════════
-generate_singbox_config() {
+generate_singbox_config() {  # generate_singbox_config [output_path]
+    local output="${1:-$SB_CONFIG}"
     local protos; protos=$(get_singbox_protocols)
     if [[ -z "$protos" ]]; then
-        rm -f "$SB_CONFIG" 2>/dev/null
+        [[ "$output" == "$SB_CONFIG" ]] && rm -f "$output" 2>/dev/null
         return 1
     fi
-    mkdir -p "$CFG" "$RULESET_DIR"
+    mkdir -p "$CFG" "$RULESET_DIR" "$(dirname "$output")"
     local listen; listen=$(_listen_addr)
 
     local inbounds="[]" outbounds="[]" endpoints="[]" rules="[]" rs_defs="[]"
@@ -4924,23 +4952,21 @@ generate_singbox_config() {
     [[ "$(echo "$endpoints" | jq 'length')" != "0" ]] && \
         conf=$(echo "$conf" | jq -c --argjson e "$endpoints" '.endpoints = $e')
 
-    printf '%s\n' "$conf" | jq . >"${SB_CONFIG}.tmp" 2>/dev/null || {
-        _err "Sing-box 配置 JSON 生成失败"; rm -f "${SB_CONFIG}.tmp"; return 1; }
-    chmod 600 "${SB_CONFIG}.tmp"
+    printf '%s\n' "$conf" | jq . >"${output}.tmp" 2>/dev/null || {
+        _err "Sing-box 配置 JSON 生成失败"; rm -f "${output}.tmp"; return 1; }
+    chmod 600 "${output}.tmp"
 
-    if [[ -x "$SB_BIN" ]]; then
+    local check_bin="${SONGBOX_SB_CHECK_BIN:-$SB_BIN}"
+    if [[ -x "$check_bin" ]]; then
         local check_out
-        # 与 systemd 单元保持一致：老配置仍可能含 legacy 字段，
-        # 否则会出现"服务跑得起来但 check 报错"的割裂
-        if ! check_out=$(ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true \
-                         "$SB_BIN" check -c "${SB_CONFIG}.tmp" 2>&1); then
+        if ! check_out=$("$check_bin" check -c "${output}.tmp" 2>&1); then
             _err "Sing-box 配置校验失败:"
             echo "$check_out" | head -8 | sed 's/^/    /' >&2
-            rm -f "${SB_CONFIG}.tmp"
+            rm -f "${output}.tmp"
             return 1
         fi
     fi
-    mv "${SB_CONFIG}.tmp" "$SB_CONFIG"
+    mv "${output}.tmp" "$output"
     _ok "Sing-box 配置已生成 ($(echo "$protos" | wc -w) 个协议 / $(echo "$inbounds" | jq 'length') 个入站)"
     return 0
 }
@@ -5040,7 +5066,7 @@ EOF
 }
 
 create_singbox_service() {
-    local env="ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true"
+    local env=""
     local pre=""
     [[ -f "$CFG/hop-nat.sh" ]] && pre="-/bin/bash $CFG/hop-nat.sh"
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -9777,8 +9803,7 @@ manage_protocol_services() {
             4) generate_singbox_config && reload_config && _refresh_subscription_files; _pause ;;
             5)
                 if [[ -f "$SB_CONFIG" ]]; then
-                    ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true \
-                        "$SB_BIN" check -c "$SB_CONFIG" && _ok "配置校验通过" || _err "配置校验失败"
+                    "$SB_BIN" check -c "$SB_CONFIG" && _ok "配置校验通过" || _err "配置校验失败"
                 else
                     _warn "配置文件不存在"
                 fi
@@ -9899,6 +9924,149 @@ show_logs() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 内核版本管理
 #═══════════════════════════════════════════════════════════════════════════════
+_singbox_service_file() {
+    if [[ -n "${SONGBOX_SB_SERVICE_FILE:-}" ]]; then
+        echo "$SONGBOX_SB_SERVICE_FILE"
+    elif [[ "$DISTRO" == "alpine" ]]; then
+        echo "/etc/init.d/${SB_SVC}"
+    else
+        echo "/etc/systemd/system/${SB_SVC}.service"
+    fi
+}
+
+_atomic_install_file() {  # _atomic_install_file <source> <destination> <mode>
+    local source="$1" destination="$2" mode="$3" stage
+    mkdir -p "$(dirname "$destination")" || return 1
+    stage="${destination}.songbox-new.$$"
+    install -m "$mode" "$source" "$stage" || { rm -f "$stage"; return 1; }
+    mv -f "$stage" "$destination" || { rm -f "$stage"; return 1; }
+}
+
+_singbox_runtime_healthy() {  # _singbox_runtime_healthy [config]
+    local config="${1:-$SB_CONFIG}" attempt port ports_ok
+    for attempt in 1 2 3 4 5; do
+        if svc status "$SB_SVC" >/dev/null 2>&1; then
+            ports_ok=true
+            while IFS= read -r port; do
+                [[ -n "$port" ]] || continue
+                _port_listening "$port" || { ports_ok=false; break; }
+            done < <(jq -r '[.inbounds[]?.listen_port // empty] | unique[]' "$config" 2>/dev/null)
+            [[ "$ports_ok" == "true" ]] && return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+_rollback_singbox_upgrade() {  # <txn_dir> <had_bin> <had_config> <had_service> <was_running>
+    local txn="$1" had_bin="$2" had_config="$3" had_service="$4" was_running="$5"
+    local service_file; service_file=$(_singbox_service_file)
+    svc stop "$SB_SVC" >/dev/null 2>&1 || true
+
+    if [[ "$had_bin" == "true" ]]; then
+        _atomic_install_file "$txn/old-bin" "$SB_BIN" 755 || _err "旧 Sing-box 核心恢复失败"
+    else
+        rm -f "$SB_BIN"
+    fi
+    if [[ "$had_config" == "true" ]]; then
+        _atomic_install_file "$txn/old-config" "$SB_CONFIG" 600 || _err "旧 Sing-box 配置恢复失败"
+    else
+        rm -f "$SB_CONFIG"
+    fi
+    if [[ "$had_service" == "true" ]]; then
+        cp -a "$txn/old-service" "$service_file" || _err "旧 Sing-box 服务单元恢复失败"
+    else
+        rm -f "$service_file"
+    fi
+    [[ "$DISTRO" != "alpine" ]] && systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if [[ "$was_running" == "true" ]]; then
+        if svc start "$SB_SVC" >/dev/null 2>&1 && _singbox_runtime_healthy "$SB_CONFIG"; then
+            _ok "已恢复旧版 Sing-box 并重新启动服务"
+        else
+            _err "旧版 Sing-box 已恢复，但服务未能重新启动，请立即检查日志"
+        fi
+    fi
+}
+
+upgrade_singbox_transactional() {  # upgrade_singbox_transactional [version]
+    local requested="${1:-}" target current txn candidate candidate_config=""
+    local had_bin=false had_config=false had_service=false was_running=false service_file
+    target=$(_resolve_singbox_version "$requested") || return 1
+    current=$(_sb_version)
+    if [[ -n "$current" && "$current" == "$target" ]]; then
+        _ok "Sing-box 已是 v${target}，无需重复安装"
+        return 0
+    fi
+
+    txn=$(mktemp -d) || { _err "无法创建 Sing-box 升级暂存目录"; return 1; }
+    candidate="$txn/sing-box"
+    _info "下载并预检 Sing-box v${target}..."
+    _download_singbox_binary "$target" "$candidate" || { rm -rf "$txn"; return 1; }
+
+    if [[ -n "$(get_singbox_protocols)" ]]; then
+        candidate_config="$txn/singbox.json"
+        if ! SONGBOX_SB_VERSION_OVERRIDE="$target" SONGBOX_SB_CHECK_BIN="$candidate" \
+             generate_singbox_config "$candidate_config"; then
+            rm -rf "$txn"
+            _err "新核心无法通过现有协议配置预检，未替换当前版本"
+            return 1
+        fi
+    elif [[ -s "$SB_CONFIG" ]]; then
+        candidate_config="$txn/singbox.json"
+        cp -a "$SB_CONFIG" "$candidate_config" || { rm -rf "$txn"; return 1; }
+        if ! "$candidate" check -c "$candidate_config" >/dev/null 2>&1; then
+            rm -rf "$txn"
+            _err "新核心无法通过现有配置预检，未替换当前版本"
+            return 1
+        fi
+    fi
+
+    if [[ -e "$SB_BIN" ]]; then cp -a "$SB_BIN" "$txn/old-bin" || { rm -rf "$txn"; return 1; }; had_bin=true; fi
+    if [[ -e "$SB_CONFIG" ]]; then cp -a "$SB_CONFIG" "$txn/old-config" || { rm -rf "$txn"; return 1; }; had_config=true; fi
+    service_file=$(_singbox_service_file)
+    if [[ -e "$service_file" ]]; then cp -a "$service_file" "$txn/old-service" || { rm -rf "$txn"; return 1; }; had_service=true; fi
+    svc status "$SB_SVC" >/dev/null 2>&1 && was_running=true
+    if [[ "$was_running" == "true" ]] && ! svc stop "$SB_SVC" >/dev/null 2>&1; then
+        rm -rf "$txn"
+        _err "无法停止当前 Sing-box 服务，未执行升级"
+        return 1
+    fi
+
+    if ! _atomic_install_file "$candidate" "$SB_BIN" 755 ||
+       { [[ -n "$candidate_config" ]] && ! _atomic_install_file "$candidate_config" "$SB_CONFIG" 600; }; then
+        _err "切换 Sing-box 核心或配置失败，正在回滚"
+        _rollback_singbox_upgrade "$txn" "$had_bin" "$had_config" "$had_service" "$was_running"
+        rm -rf "$txn"
+        return 1
+    fi
+
+    if [[ -n "$candidate_config" ]] && ! create_singbox_service; then
+        _err "重建 Sing-box 服务单元失败，正在回滚"
+        _rollback_singbox_upgrade "$txn" "$had_bin" "$had_config" "$had_service" "$was_running"
+        rm -rf "$txn"
+        return 1
+    fi
+    if [[ "$(_sb_version)" != "$target" ]]; then
+        _err "新核心版本复核失败，正在回滚"
+        _rollback_singbox_upgrade "$txn" "$had_bin" "$had_config" "$had_service" "$was_running"
+        rm -rf "$txn"
+        return 1
+    fi
+
+    if [[ "$was_running" == "true" ]]; then
+        if ! svc start "$SB_SVC" >/dev/null 2>&1 || ! _singbox_runtime_healthy "$SB_CONFIG"; then
+            _err "新核心启动或端口验证失败，正在回滚"
+            _rollback_singbox_upgrade "$txn" "$had_bin" "$had_config" "$had_service" "$was_running"
+            rm -rf "$txn"
+            return 1
+        fi
+    fi
+    rm -rf "$txn"
+    _ok "Sing-box 已安全更新到 v${target}"
+    return 0
+}
+
 update_core_menu() {
     while true; do
         _header
@@ -9922,26 +10090,19 @@ update_core_menu() {
         case "$ch" in
             1)
                 _ask_yes "确认更新 Sing-box？更新期间服务会短暂中断" || { _pause; continue; }
-                local was=false; svc status "$SB_SVC" >/dev/null 2>&1 && { was=true; svc stop "$SB_SVC"; }
-                if install_singbox true; then
-                    generate_singbox_config >/dev/null 2>&1
-                    [[ "$was" == "true" ]] && svc start "$SB_SVC"
+                if upgrade_singbox_transactional; then
                     _refresh_subscription_files
                     _ok "Sing-box 更新完成"
                 else
-                    [[ "$was" == "true" ]] && svc start "$SB_SVC"
-                    _err "更新失败，已尝试恢复服务"
+                    _err "更新失败，当前核心与服务已尽量保持原状"
                 fi
                 _pause ;;
             2)
                 local v; read -rp "  请输入版本号 (如 1.12.0): " v
                 [[ -z "$v" ]] && { _pause; continue; }
-                local was=false; svc status "$SB_SVC" >/dev/null 2>&1 && { was=true; svc stop "$SB_SVC"; }
-                install_singbox true "$v" && {
-                    generate_singbox_config >/dev/null 2>&1
+                upgrade_singbox_transactional "$v" && {
                     _refresh_subscription_files
                 }
-                [[ "$was" == "true" ]] && svc start "$SB_SVC"
                 _pause ;;
             3) rm -f /usr/local/bin/snell-server; install_snell; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
             4) rm -f /usr/local/bin/snell-server-v5; install_snell_v5; restart_all_services >/dev/null; _refresh_subscription_files; _pause ;;
