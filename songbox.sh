@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  songbox v0.1.2 [Sing-box 统一内核]
+#  songbox v0.1.3 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -25,7 +25,7 @@ fi
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.1.2"
+readonly VERSION="0.1.3"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="songbox"
 readonly CUSTOM_BUILD="backup-v2+compat-upgrade+realm+subscription-sync+sb-1.14"
