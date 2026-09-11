@@ -57,6 +57,16 @@ fi
 "$SB_TEST_BIN" check -c "$OUTPUT" || fail "sing-box rejected the generated configuration"
 pass "generated configuration passes $("$SB_TEST_BIN" version | head -1)"
 
+# 回归：auto_detect_interface 会拉起 sing-tun networkUpdateMonitor，在 netlink 事件
+# 频繁的宿主机上可能 select 空转并占满一个 CPU 核；服务端场景不需要该选项。
+jq -e '.route.auto_detect_interface == false' "$OUTPUT" >/dev/null ||
+    fail "auto_detect_interface must stay false on server-side configurations"
+# 回归：纯服务端没有可缓存的状态，cache_file 只会带来一个可被异常重启截断的 bbolt 库。
+if jq -e '.experimental.cache_file' "$OUTPUT" >/dev/null 2>&1; then
+    fail "cache_file must not be generated for server-side configurations"
+fi
+pass "runtime safety options are not enabled on server-side configurations"
+
 legacy=$(SONGBOX_SB_VERSION_OVERRIDE=1.11.15 _sb_apply_domain_strategy '{"type":"direct","tag":"direct"}' ipv4_only)
 modern=$(SONGBOX_SB_VERSION_OVERRIDE=1.14.0 _sb_apply_domain_strategy '{"type":"direct","tag":"direct"}' ipv4_only)
 jq -e '.domain_strategy == "ipv4_only" and (.domain_resolver == null)' <<<"$legacy" >/dev/null ||

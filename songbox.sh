@@ -4933,16 +4933,21 @@ generate_singbox_config() {  # generate_singbox_config [output_path]
 
     #── 组装 ─────────────────────────────────────────────────────────────────────
     local conf route_json
+    # auto_detect_interface 仅用于 TUN 等需要防路由环路的客户端场景。songbox 不生成
+    # TUN 入站，多 IP 出口走显式 inet4_bind_address/inet6_bind_address，因此这里必须
+    # 保持 false：置 true 会拉起 sing-tun 的 networkUpdateMonitor，在 netlink 事件频繁
+    # 的宿主机（如运行 Podman/LXC 的 NAT 母鸡）上可能陷入 select 空转并占满一个 CPU 核。
     route_json=$(jq -nc --argjson rl "$rules" --argjson rs "$rs_defs" \
-        '{rules:$rl, final:"direct", auto_detect_interface:true}
+        '{rules:$rl, final:"direct", auto_detect_interface:false}
          + (if ($rs|length) > 0 then {rule_set:$rs} else {} end)')
+    # 纯服务端不使用 FakeIP / RDRC / Clash 选择记录，rule_set 也全部是本地文件，
+    # cache_file 存不下任何有用状态，却会在每次启动时打开一个可能被异常重启截断的 bbolt 库。
     conf=$(jq -nc --argjson inb "$inbounds" --argjson oub "$outbounds" \
-        --argjson route "$route_json" --arg cache "$CFG/cache.db" '
+        --argjson route "$route_json" '
         {log:{level:"warn", timestamp:true},
          inbounds:$inb,
          outbounds:$oub,
-         route:$route,
-         experimental:{cache_file:{enabled:true, path:$cache}}}')
+         route:$route}')
     # 新版 domain_resolver 引用的 DNS 服务器必须存在
     if ! _sb_uses_legacy_domain_strategy; then
         conf=$(echo "$conf" | jq -c --arg t "$SB_DNS_TAG" \
@@ -5046,7 +5051,8 @@ _write_systemd() {  # name desc exec [env] [pre]
     cat >"/etc/systemd/system/${name}.service" <<EOF
 [Unit]
 Description=${desc}
-After=network.target nss-lookup.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
 Type=simple
