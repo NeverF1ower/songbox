@@ -23,6 +23,15 @@ fi
 #    Snell v4 / v5 / v6 / Snell+ShadowTLS（独立进程）
 #
 #  适配: Alpine / Debian / Ubuntu / CentOS
+#
+#  本地补丁 snell-fix1（未合并回上游，运行「检查脚本更新」会被覆盖）:
+#    1. Snell 版本不再硬编码，改为读官方发布说明动态解析，可用
+#       SNELL_V4/5/6_VERSION 环境变量强制指定；保底版本仅在取不到列表时使用
+#    2. Surge 客户端行补 v6 的 mode=（漏掉会导致 mode 不一致 → 静默超时）
+#    3. 订阅里的 tfo 改为读数据库，不再硬编码 tfo=true
+#    4. v6 推荐 DNS 按本机是否有 IPv6 出口自适应
+#    5. allow_port 识别 INPUT 默认策略 DROP/REJECT，并同步处理 ip6tables
+#    6. Snell 多端口实例时明确告警（单配置文件限制，未根治）
 #═══════════════════════════════════════════════════════════════════════════════
 
 readonly VERSION="0.1.3"
@@ -1375,12 +1384,28 @@ install_singbox() {
 #───────────────────────────────────────────────────────────────────────────────
 # Snell（闭源，独立进程）
 #───────────────────────────────────────────────────────────────────────────────
-readonly SNELL_V4_VERSION="4.1.1"
-readonly SNELL_V5_VERSION="5.0.1"
-readonly SNELL_V6_VERSION="6.0.0b4"
+# Snell 版本不做硬编码：先向官方发布说明查询当前实际提供下载的版本，
+# 取不到时才回退到下面的保底版本。也可用环境变量强制指定：
+#   SNELL_V6_VERSION=6.0.0rc2 vless
+readonly SNELL_RELEASE_NOTES="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
+# 保底版本：仅在拿不到官方列表时使用，不是版本上限
+readonly SNELL_V4_FALLBACK="4.1.1"
+readonly SNELL_V5_FALLBACK="5.0.1"
+readonly SNELL_V6_FALLBACK="6.0.0rc2"
 
+declare -A _SNELL_VER_CACHE=()
+_SNELL_PAGE_CACHE=""
+_SNELL_PAGE_FETCHED=0
+
+# 已知版本的官方压缩包 SHA-256：命中即强校验。
+# 官方对 Snell 不公布校验和，新版本（含 beta/rc）默认走 _confirm_unverified 人工确认；
+# 自行校验过的可用环境变量补充，例如：
+#   SNELL_SHA256_6_0_0rc2_amd64=<64位哈希> vless
 _snell_sha256() {  # version arch
-    case "${1}:${2}" in
+    local _k="${1}:${2}" _envk
+    _envk="SNELL_SHA256_${_k}"; _envk="${_envk//[.:-]/_}"
+    [[ -n "${!_envk:-}" ]] && { echo "${!_envk}"; return 0; }
+    case "$_k" in
         4.1.1:amd64)   echo "cc2271b79c7506888b34e651e8741b3aa7fc7d5f60aa65ef8bb096f3313a193b" ;;
         4.1.1:aarch64) echo "38d4cdc03dcdb3608af8594df83e1795265167fafc5d802f815148908902d758" ;;
         4.1.1:armv7l)  echo "d00b98ed803be4039f0f0630b810932cd3d3d87ee3e6ed224106fdc63347d8e6" ;;
@@ -1391,6 +1416,97 @@ _snell_sha256() {  # version arch
         6.0.0b4:aarch64) echo "2c957ee6bb37ce4b1df2b6a23e652b75546d10bc4f0443a2928e5834ae0429af" ;;
         *) return 1 ;;
     esac
+}
+
+# 版本排序键：主.次.补 + 阶段(alpha 0 < beta 1 < rc 2 < 正式 3) + 阶段序号
+# 定宽数字串，可直接做字符串比较。例：6.0.0b4 < 6.0.0rc < 6.0.0rc2 < 6.0.0
+_snell_ver_key() {  # version
+    local v="$1" core suffix stage num a b c
+    core="${v%%[!0-9.]*}"; core="${core%.}"
+    suffix="${v#"$core"}"
+    IFS='.' read -r a b c <<<"$core"
+    case "$suffix" in
+        "")              stage=3 ;;
+        b|b[0-9]*|beta*) stage=1 ;;
+        rc|rc[0-9]*)     stage=2 ;;
+        *)               stage=0 ;;
+    esac
+    num=$(printf '%s' "$suffix" | tr -dc '0-9')
+    printf '%05d%05d%05d%d%05d' \
+        "$((10#${a:-0}))" "$((10#${b:-0}))" "$((10#${c:-0}))" "$stage" "$((10#${num:-0}))"
+}
+
+# 抓官方发布说明，整个进程只抓一次。
+# 必须在父 shell 里调用：_snell_remote_versions 会被放进进程替换（子 shell），
+# 在那里写全局变量是丢的。
+_snell_fetch_release_page() {
+    [[ "$_SNELL_PAGE_FETCHED" == "1" ]] && return 0
+    _SNELL_PAGE_FETCHED=1
+    check_cmd curl || return 0
+    _SNELL_PAGE_CACHE=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "$SNELL_RELEASE_NOTES" 2>/dev/null || true)
+    return 0
+}
+
+# 从已缓存的发布说明里抽取“当前确实提供下载”的版本，并按本机架构过滤（纯解析，不联网）
+_snell_remote_versions() {  # major arch
+    local major="$1" arch="$2"
+    [[ -z "$_SNELL_PAGE_CACHE" ]] && return 1
+    printf '%s' "$_SNELL_PAGE_CACHE" \
+        | grep -oE "snell-server-v[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z]*-linux-${arch}\.zip" \
+        | sed -E "s#^snell-server-v(.+)-linux-${arch}\.zip\$#\1#" \
+        | grep -E "^${major}\." | sort -u
+}
+
+# 解析某个大版本当前应安装的版本号
+_snell_version() {  # major [quiet]
+    local major="$1" quiet="${2:-}" arch ovr cached best="" bk="" v vk
+    case "$major" in
+        4) ovr="${SNELL_V4_VERSION:-}" ;;
+        5) ovr="${SNELL_V5_VERSION:-}" ;;
+        6) ovr="${SNELL_V6_VERSION:-}" ;;
+        *) return 1 ;;
+    esac
+    [[ -n "$ovr" ]] && { echo "$ovr"; return 0; }
+
+    arch=$(_map_arch "amd64:aarch64:armv7l") || return 1
+    cached="${_SNELL_VER_CACHE[${major}:${arch}]:-}"
+    [[ -n "$cached" ]] && { echo "$cached"; return 0; }
+
+    _snell_fetch_release_page
+    while IFS= read -r v; do
+        [[ -z "$v" ]] && continue
+        vk=$(_snell_ver_key "$v")
+        if [[ -z "$bk" || "$vk" > "$bk" ]]; then best="$v"; bk="$vk"; fi
+    done < <(_snell_remote_versions "$major" "$arch" 2>/dev/null)
+
+    if [[ -z "$best" ]]; then
+        if [[ -n "$_SNELL_PAGE_CACHE" ]]; then
+            # 官方列表拿到了，但没有本机架构的构建 —— 别用保底版本去撞 404
+            [[ "$quiet" != "quiet" ]] && {
+                _err "官方发布页未提供 Snell v${major} 的 ${arch} 构建"
+                [[ "$major" == "6" ]] &&
+                    echo -e "  ${D}Snell v6 自 rc 起仅提供 amd64 / i386 / aarch64${NC}" >&2
+            }
+            return 1
+        fi
+        case "$major" in
+            4) best="$SNELL_V4_FALLBACK" ;;
+            5) best="$SNELL_V5_FALLBACK" ;;
+            6) best="$SNELL_V6_FALLBACK" ;;
+        esac
+        [[ "$quiet" != "quiet" ]] &&
+            _warn "无法访问官方发布页，Snell v${major} 回退到保底版本 ${best}"
+    fi
+    _SNELL_VER_CACHE["${major}:${arch}"]="$best"
+    echo "$best"
+}
+
+_snell_installed_version() {  # binary
+    check_cmd "$1" || return 1
+    local out
+    out=$("$1" --v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z]*' | head -1)
+    [[ -n "$out" ]] && echo "$out"
 }
 
 ensure_snell_alpine_runtime() {
@@ -1430,11 +1546,17 @@ _install_snell_generic() {  # version target_bin
     local expect; expect=$(_snell_sha256 "$ver" "$arch" 2>/dev/null || true)
     local tmp; tmp=$(mktemp -d) || return 1
     if ! curl -fL --connect-timeout 20 --max-time 120 --retry 3 -o "$tmp/s.zip" "$url"; then
-        rm -rf "$tmp"; _err "Snell 下载失败: $url"; return 1
+        rm -rf "$tmp"
+        _err "Snell 下载失败: $url"
+        echo -e "  ${D}若为 404，通常是该版本没有 ${arch} 构建；可用 SNELL_V*_VERSION 指定其他版本${NC}" >&2
+        return 1
     fi
     if [[ -n "$expect" ]]; then
         _verify_sha256 "$tmp/s.zip" "$expect" || { rm -rf "$tmp"; _err "Snell SHA-256 校验失败"; return 1; }
     else
+        local _hint="SNELL_SHA256_${ver}:${arch}"; _hint="${_hint//[.:-]/_}"
+        _warn "Snell v${ver} (${arch}): 官方未公布 SHA-256，脚本内置哈希表也无此版本"
+        echo -e "  ${D}自行校验后可用 ${_hint}=<64位哈希> 重试以启用强校验${NC}" >&2
         _confirm_unverified "Snell v${ver} (${arch})" || { rm -rf "$tmp"; return 1; }
     fi
     _archive_safe "$tmp/s.zip" zip && unzip -oq "$tmp/s.zip" -d "$tmp" || {
@@ -1449,9 +1571,20 @@ _install_snell_generic() {  # version target_bin
     _ok "Snell v${ver} 已安装: $target"
 }
 
-install_snell()    { check_cmd snell-server    && { _ok "Snell v4 已安装"; return 0; }; _install_snell_generic "$SNELL_V4_VERSION" /usr/local/bin/snell-server; }
-install_snell_v5() { check_cmd snell-server-v5 && { _ok "Snell v5 已安装"; return 0; }; _install_snell_generic "$SNELL_V5_VERSION" /usr/local/bin/snell-server-v5; }
-install_snell_v6() { check_cmd snell-server-v6 && { _ok "Snell v6 已安装"; return 0; }; _install_snell_generic "$SNELL_V6_VERSION" /usr/local/bin/snell-server-v6; }
+_snell_install_major() {  # major binary target
+    local major="$1" bname="$2" target="$3" ver cur
+    if check_cmd "$bname"; then
+        cur=$(_snell_installed_version "$bname")
+        _ok "Snell v${major} 已安装 (${cur:-版本未知})"
+        return 0
+    fi
+    ver=$(_snell_version "$major") || return 1
+    _install_snell_generic "$ver" "$target"
+}
+
+install_snell()    { _snell_install_major 4 snell-server    /usr/local/bin/snell-server; }
+install_snell_v5() { _snell_install_major 5 snell-server-v5 /usr/local/bin/snell-server-v5; }
+install_snell_v6() { _snell_install_major 6 snell-server-v6 /usr/local/bin/snell-server-v6; }
 
 install_shadowtls() {
     check_cmd shadow-tls && { _ok "ShadowTLS 已安装"; return 0; }
@@ -1495,8 +1628,33 @@ firewall_managed() {
 # 只增加 ACCEPT，且仅在"你已经有防火墙在跑"时才动手：
 #   ufw      -> 仅当 ufw 已 active（绝不执行 ufw enable）
 #   firewalld-> 仅当 firewalld 已运行（绝不启动它）
-#   iptables -> 仅当 INPUT 里已存在 DROP/REJECT 全局规则（即你本来就是限制型）
+#   iptables -> 仅当 INPUT 默认策略为 DROP/REJECT，或已存在全局 DROP/REJECT 规则
+#               （即你本来就是限制型）；同一条件下同时处理 ip6tables
 # 全端口开放的机器上，这个函数什么都不做。
+
+# INPUT 是否处于限制型状态
+_ipt_restrictive() {  # <iptables|ip6tables>
+    local ipt="$1" pol
+    pol=$("$ipt" -S INPUT 2>/dev/null | head -1 | awk '{print $3}')
+    [[ "$pol" == "DROP" || "$pol" == "REJECT" ]] && return 0
+    "$ipt" -L INPUT -n 2>/dev/null | grep -qE '^(DROP|REJECT)[[:space:]]+all' && return 0
+    return 1
+}
+
+# 只在限制型 INPUT 上插一条 ACCEPT；确实插入返回 0，未改动返回 1
+_ipt_allow() {  # <iptables|ip6tables> <proto> <dport>
+    local ipt="$1" proto="$2" dport="$3"
+    check_cmd "$ipt" || return 1
+    "$ipt" -C INPUT -p "$proto" --dport "$dport" -j ACCEPT >/dev/null 2>&1 && return 1
+    # 带 comment 的规则 -C 匹配不到，需按注释判重，否则每次运行都会重复插入
+    "$ipt" -S INPUT 2>/dev/null | grep -qE -- "--comment \"?vless-${proto}-${dport}\"?( |\$)" && return 1
+    _ipt_restrictive "$ipt" || return 1
+    "$ipt" -I INPUT -p "$proto" --dport "$dport" \
+        -m comment --comment "vless-${proto}-${dport}" -j ACCEPT >/dev/null 2>&1 || return 1
+    _ok "${ipt} 已放行 ${dport}/${proto}"
+    return 0
+}
+
 allow_port() {
     local port="$1" proto="${2:-tcp}" changed=0
     [[ -z "$port" ]] && return 1
@@ -1520,16 +1678,15 @@ allow_port() {
         return 0
     fi
 
-    # iptables + netfilter-persistent（Debian/Ubuntu 常见）
+    # iptables / ip6tables + netfilter-persistent（Debian/Ubuntu 常见）
     if check_cmd iptables; then
-        local dport="$port"
-        [[ "$port" == *:* ]] && dport="$port" # iptables 支持 --dport a:b
-        if ! iptables -C INPUT -p "$proto" --dport "$dport" -j ACCEPT >/dev/null 2>&1; then
-            if iptables -L INPUT -n 2>/dev/null | grep -qE '^(DROP|REJECT)\s+all'; then
-                iptables -I INPUT -p "$proto" --dport "$dport" -m comment --comment "vless-${proto}-${dport}" -j ACCEPT >/dev/null 2>&1
-                check_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1
-                _ok "iptables 已放行 ${dport}/${proto}"
-            fi
+        local dport="$port" changed_ipt=0   # iptables 支持 --dport a:b
+        _ipt_allow iptables "$proto" "$dport" && changed_ipt=1
+        if _has_ipv6 && check_cmd ip6tables; then
+            _ipt_allow ip6tables "$proto" "$dport" && changed_ipt=1
+        fi
+        if [[ "$changed_ipt" == "1" ]] && check_cmd netfilter-persistent; then
+            netfilter-persistent save >/dev/null 2>&1
         fi
     fi
     return 0
@@ -1553,6 +1710,10 @@ show_firewall_footprint() {
     local pol_in ufw_state fw_state
     pol_in=$(iptables -S INPUT 2>/dev/null | head -1 | awk '{print $3}')
     echo -e "  INPUT 默认策略: $( [[ "$pol_in" == "ACCEPT" ]] && echo "${G}ACCEPT (全开)${NC}" || echo "${Y}${pol_in}${NC}" )" >&2
+    if check_cmd ip6tables; then
+        local pol_in6; pol_in6=$(ip6tables -S INPUT 2>/dev/null | head -1 | awk '{print $3}')
+        [[ -n "$pol_in6" ]] && echo -e "  INPUT6 默认策略: $( [[ "$pol_in6" == "ACCEPT" ]] && echo "${G}ACCEPT (全开)${NC}" || echo "${Y}${pol_in6}${NC}" )" >&2
+    fi
     if check_cmd ufw; then
         ufw_state=$(ufw status 2>/dev/null | head -1)
         echo -e "  ufw     : ${D}${ufw_state:-未知}${NC}" >&2
@@ -1573,6 +1734,12 @@ show_firewall_footprint() {
         [[ -z "$line" ]] && continue
         echo -e "    ${C}[放行]${NC} ${D}${line}${NC}" >&2; ((n++))
     done < <(iptables -S INPUT 2>/dev/null | grep -- '--comment "vless-' )
+    if check_cmd ip6tables; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            echo -e "    ${C}[放行6]${NC} ${D}${line}${NC}" >&2; ((n++))
+        done < <(ip6tables -S INPUT 2>/dev/null | grep -- '--comment "vless-' )
+    fi
     # 2) 流量统计链
     if iptables -S "$TRAFFIC_CHAIN" >/dev/null 2>&1; then
         local cnt; cnt=$(iptables -S "$TRAFFIC_CHAIN" 2>/dev/null | grep -c -- '--comment "vt:')
@@ -1620,6 +1787,13 @@ cleanup_firewall_footprint() {
         # shellcheck disable=SC2086
         iptables ${rule/-A /-D } >/dev/null 2>&1 && ((removed++))
     done < <(iptables -S INPUT 2>/dev/null | grep -- '--comment "vless-')
+    if check_cmd ip6tables; then
+        while IFS= read -r rule; do
+            [[ -z "$rule" ]] && continue
+            # shellcheck disable=SC2086
+            ip6tables ${rule/-A /-D } >/dev/null 2>&1 && ((removed++))
+        done < <(ip6tables -S INPUT 2>/dev/null | grep -- '--comment "vless-')
+    fi
     if iptables -S INPUT 2>/dev/null | grep -q -- "-j ${TRAFFIC_CHAIN}"; then
         iptables -D INPUT -j "$TRAFFIC_CHAIN" >/dev/null 2>&1 && ((removed++))
     fi
@@ -5189,6 +5363,12 @@ gen_snell_conf() {  # proto
     conf="${SNELL_CONF[$proto]}"
     cfg=$(db_instances snell "$proto" | head -1)
     [[ -z "$cfg" ]] && return 1
+    # Snell 是独立进程 + 单配置文件，多端口实例只有第一个会真正监听
+    local _ninst; _ninst=$(db_count_instances snell "$proto" 2>/dev/null)
+    if [[ "${_ninst:-1}" -gt 1 ]]; then
+        _warn "$(get_protocol_name "$proto") 有 ${_ninst} 个端口实例，但 Snell 为单配置文件独立进程"
+        echo -e "  ${D}只有端口 $(echo "$cfg" | jq -r '.port') 会监听，其余实例的节点必然连接超时${NC}" >&2
+    fi
     local psk port version listen bind
     psk=$(echo "$cfg" | jq -r '.psk')
     port=$(echo "$cfg" | jq -r '.port')
@@ -5766,9 +5946,11 @@ print_client_snippet() {
         snell|snell-v5|snell-v6)
             psk=$(echo "$cfg" | jq -r '.psk')
             version=$(echo "$cfg" | jq -r '.version // "4"')
-            local tfo; tfo=$(echo "$cfg" | jq -r '.tfo // "true"')
+            local tfo mode_p=""; tfo=$(echo "$cfg" | jq -r '.tfo // "true"')
+            # v6 的 mode 必须与服务端一致；低于 v6 传 mode 是 Surge 配置错误
+            [[ "$version" == "6" ]] && mode_p=", mode=$(echo "$cfg" | jq -r '.mode // "default"')"
             echo -e "  ${Y}Surge:${NC}" >&2
-            echo -e "  ${C}${label} = snell, ${addr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=${tfo}${NC}" >&2 ;;
+            echo -e "  ${C}${label} = snell, ${addr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=${tfo}${mode_p}${NC}" >&2 ;;
         snell-shadowtls|snell-v5-shadowtls)
             psk=$(echo "$cfg" | jq -r '.psk')
             version=$(echo "$cfg" | jq -r '.version // "4"')
@@ -8742,16 +8924,22 @@ _install_one_protocol() {
                 local mc mode; read -rp "  混淆模式 [1]: " mc
                 case "$mc" in 2) mode="unshaped" ;; 3) mode="unsafe-raw" ;; *) mode="default" ;; esac
                 echo "" >&2
-                _item "1" "推荐混合 DNS ${D}(1.1.1.1,8.8.8.8,2001:4860:4860::8888)${NC}"
+                # 没有 IPv6 出口就不要写 IPv6 DNS：c-ares 轮询到不可达地址会拖慢甚至拖死解析，
+                # 表现为 TCP 连得上、但每个请求都超时
+                local rec_dns="1.1.1.1,8.8.8.8"
+                _has_ipv6_network && rec_dns="1.1.1.1,8.8.8.8,2001:4860:4860::8888"
+                _item "1" "推荐 DNS ${D}(${rec_dns})${NC}"
                 _item "2" "系统默认"
                 _item "3" "自定义"
                 local dc dns=""; read -rp "  DNS [1]: " dc
                 case "$dc" in
                     2) dns="" ;;
                     3) read -rp "  DNS 列表 (逗号分隔): " dns; dns="${dns//[[:space:]]/}" ;;
-                    *) dns="1.1.1.1,8.8.8.8,2001:4860:4860::8888" ;;
+                    *) dns="$rec_dns" ;;
                 esac
                 echo "" >&2
+                _has_ipv6_network ||
+                    echo -e "  ${D}本机无 IPv6 出口，请勿选择 prefer-ipv6 / ipv6-only${NC}" >&2
                 _item "1" "default"; _item "2" "prefer-ipv4"; _item "3" "prefer-ipv6"
                 _item "4" "ipv4-only"; _item "5" "ipv6-only"
                 local pc pref; read -rp "  DNS IP 偏好 [1]: " pc
@@ -9479,10 +9667,14 @@ gen_surge_sub() {
             case "$proto" in
                 snell|snell-v5|snell-v6)
                     label=$(_node_label "$proto" "$cc" "")
-                    line="${label} = snell, ${iaddr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=true" ;;
+                    local stfo smode=""
+                    stfo=$(echo "$cfg" | jq -r '.tfo // "true"')
+                    [[ "$version" == "6" ]] && smode=", mode=$(echo "$cfg" | jq -r '.mode // "default"')"
+                    line="${label} = snell, ${iaddr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=${stfo}${smode}" ;;
                 snell-shadowtls|snell-v5-shadowtls)
                     label=$(_node_label "$proto" "$cc" "")
-                    line="${label} = snell, ${iaddr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=true, shadow-tls-password=${stls}, shadow-tls-sni=${sni}, shadow-tls-version=3" ;;
+                    local stfo2; stfo2=$(echo "$cfg" | jq -r '.tfo // "true"')
+                    line="${label} = snell, ${iaddr}, ${port}, psk=${psk}, version=${version}, reuse=true, tfo=${stfo2}, shadow-tls-password=${stls}, shadow-tls-sni=${sni}, shadow-tls-version=3" ;;
                 trojan|trojan-ws|hy2|anytls|ss-legacy|ss2022|tuic|ss2022-shadowtls|vmess-ws|socks|naive)
                     local un sec path
                     path=$(echo "$cfg" | jq -r '.path // "/"')
@@ -10081,9 +10273,16 @@ update_core_menu() {
         local sbv
         sbv=$(_sb_version); [[ -z "$sbv" ]] && sbv="未安装"
         echo -e "  ${W}Sing-box${NC}      当前: ${G}${sbv}${NC}" >&2
-        echo -e "  ${W}Snell v4${NC}      当前: ${G}$(check_cmd snell-server && snell-server --v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 未安装)${NC}   推荐: ${C}${SNELL_V4_VERSION}${NC}" >&2
-        echo -e "  ${W}Snell v5${NC}      当前: ${G}$(check_cmd snell-server-v5 && snell-server-v5 --v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 未安装)${NC}   推荐: ${C}${SNELL_V5_VERSION}${NC}" >&2
-        echo -e "  ${W}Snell v6${NC}      当前: ${G}$(check_cmd snell-server-v6 && snell-server-v6 --v 2>&1 | grep -oE '6\.[0-9]+\.[0-9]+[A-Za-z0-9]*' | head -1 || echo 未安装)${NC}   推荐: ${C}${SNELL_V6_VERSION}${NC}" >&2
+        local s4c s5c s6c s4r s5r s6r
+        s4c=$(_snell_installed_version snell-server);    s4c="${s4c:-未安装}"
+        s5c=$(_snell_installed_version snell-server-v5); s5c="${s5c:-未安装}"
+        s6c=$(_snell_installed_version snell-server-v6); s6c="${s6c:-未安装}"
+        # 先在父 shell 里抓一次发布说明，下面三个命令替换才能共用同一份缓存
+        _snell_fetch_release_page
+        s4r=$(_snell_version 4 quiet); s5r=$(_snell_version 5 quiet); s6r=$(_snell_version 6 quiet)
+        echo -e "  ${W}Snell v4${NC}      当前: ${G}${s4c}${NC}   最新: ${C}${s4r:-查询失败}${NC}" >&2
+        echo -e "  ${W}Snell v5${NC}      当前: ${G}${s5c}${NC}   最新: ${C}${s5r:-查询失败}${NC}" >&2
+        echo -e "  ${W}Snell v6${NC}      当前: ${G}${s6c}${NC}   最新: ${C}${s6r:-本架构无构建}${NC} ${D}(Beta)${NC}" >&2
         _line
         _item "1" "更新 Sing-box 到最新版"
         _item "2" "安装 Sing-box 指定版本"
